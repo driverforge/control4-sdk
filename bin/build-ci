@@ -1,0 +1,64 @@
+#!/usr/bin/env sh
+# Build the SDK bundle. Expects `squish` on PATH (provided by the anvil-lua
+# toolchain image — see ../README.md). Don't call this directly: use
+# `./bin/build`, which routes here either by direct invocation (CI inside the
+# toolchain container, or a dev with squish locally) or by running this inside
+# the toolchain image for everyone else.
+set -e
+
+mkdir -p dist
+
+# Squish src/ into a single Lua module (dist/driverforge-sdk.lua). The SDK is open
+# source (MIT) and ships as readable Lua — there is no obfuscation step.
+# --no-minify keeps the published artifact human-readable and preserves the
+# inline third-party license headers (e.g. StackTracePlus).
+squish --no-minify
+
+# Inject the attestation root PUBLIC key into the build OUTPUT at the sentinel
+# marker (DF-511). Committed source keeps an empty key map; only the built
+# bundle carries a key, so the dev key never lands in mirrored source. With no
+# key provided the bundle keeps the empty map and agent verification stays
+# disabled (the legacy discovery-trusts-filename behaviour).
+if [ -n "${SDK_ATTESTATION_N:-}" ]; then
+    kid="${SDK_ATTESTATION_KID:?SDK_ATTESTATION_KID is required alongside the key}"
+    e_hex="${SDK_ATTESTATION_E:?SDK_ATTESTATION_E is required alongside the modulus}"
+
+    # Guard: the modulus and exponent are hex, and only hex. Anything else is
+    # either the wrong material or a quoting accident, and both must fail the
+    # build rather than embed a key the SDK cannot parse.
+    if ! printf '%s' "$SDK_ATTESTATION_N" | grep -qE '^[0-9a-f]+$' \
+        || ! printf '%s' "$e_hex" | grep -qE '^[0-9a-f]+$'; then
+        echo "::error::attestation key material is not lowercase hex (kid ${kid})" >&2
+        exit 1
+    fi
+
+    # Release guard: a prod build must carry the prod kid, never the dev key.
+    if [ "${SDK_BUILD_ENV:-prod}" = "prod" ] && [ "$kid" != "attest-prod-1" ]; then
+        echo "::error::prod build tried to inject kid '${kid}' (expected attest-prod-1)" >&2
+        exit 1
+    fi
+
+    keyfile="dist/.attestation-keys.lua"
+    printf 'M.ROOT_PUBLIC_KEYS = { ["%s"] = { n = "%s", e = "%s" } }\n' \
+        "$kid" "$SDK_ATTESTATION_N" "$e_hex" > "$keyfile"
+
+    # Replace the single marker line with the populated map.
+    awk -v kf="$keyfile" '
+        /SDK_ATTESTATION_KEYS/ {
+            while ((getline line < kf) > 0) print line
+            close(kf)
+            next
+        }
+        { print }
+    ' dist/driverforge-sdk.lua > dist/driverforge-sdk.lua.tmp
+    mv dist/driverforge-sdk.lua.tmp dist/driverforge-sdk.lua
+    rm -f "$keyfile"
+
+    if ! grep -q "\[\"${kid}\"\]" dist/driverforge-sdk.lua; then
+        echo "::error::attestation key injection did not take — marker not found in the bundle" >&2
+        exit 1
+    fi
+    echo "Injected attestation key (kid: ${kid})"
+else
+    echo "No attestation key provided — agent verification disabled in this build"
+fi

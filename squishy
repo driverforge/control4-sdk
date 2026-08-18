@@ -1,0 +1,10 @@
+Main "./src/harness.lua"
+
+Module "queue" "./src/queue.lua"
+Module "agent_verify" "./src/agent_verify.lua"
+Module "stacktrace" "./src/stacktrace.lua"
+Module "rs256" "./src/rs256.lua"
+Module "client" "./src/client.lua"
+Module "version" "./src/version.lua"
+
+Output "dist/driverforge-sdk.lua"

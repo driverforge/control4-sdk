@@ -1,0 +1,96 @@
+#!/usr/bin/env sh
+# Build the Anvil SDK bundle. Local-friendly: if `squish` is on PATH (CI is
+# already inside the anvil-lua toolchain image; or you have squish installed
+# locally), runs the actual build (bin/build-ci) directly. Otherwise runs that
+# build inside the toolchain image via docker — so a local dev doesn't have
+# to install squish to build the SDK.
+set -e
+
+project_dir=$PWD
+script_dir="$(cd "$(dirname "$0")" && pwd)"
+
+# Attestation key target (DF-511). The build injects an attestation root
+# PUBLIC key into the OUTPUT bundle so the SDK can verify the agent's
+# identity; committed source stays key-less. Default is prod (the in-tree
+# key that mirrors to OSS); --dev / SDK_BUILD_ENV=dev embeds the dev key,
+# which lives OUTSIDE sdk/** so it never reaches the mirror. Only ever
+# a public key — nothing secret is embedded.
+env_target="${SDK_BUILD_ENV:-prod}"
+for arg in "$@"; do
+    case "$arg" in
+        --dev) env_target="dev" ;;
+        --prod) env_target="prod" ;;
+        *) echo "unknown build option: $arg" >&2; exit 2 ;;
+    esac
+done
+
+case "$env_target" in
+    prod)
+        pem_file="${script_dir}/../keys/attestation-public-prod-1.pem"
+        kid="attest-prod-1"
+        ;;
+    dev)
+        # Repo-root dev-keys/, outside the sdk/** mirror allowlist.
+        pem_file="${script_dir}/../../dev-keys/attestation-public-dev-1.pem"
+        kid="attest-dev-1"
+        ;;
+    *) echo "invalid SDK_BUILD_ENV '$env_target' (expected prod|dev)" >&2; exit 2 ;;
+esac
+
+if [ ! -f "$pem_file" ]; then
+    echo "attestation public key not found for target '$env_target': $pem_file" >&2
+    if [ "$env_target" = dev ]; then
+        echo "  the dev key lives outside sdk/** so it never mirrors — see dev-keys/README.md" >&2
+    fi
+    exit 1
+fi
+
+# Resolve the key on the host and pass it by value: the dev key is outside
+# the docker mount (which is sdk only), so build-ci can't read the file
+# itself. build-ci injects from these env vars.
+#
+# The SDK verifies in pure Lua and has no ASN.1 parser, so what gets embedded
+# is the modulus and exponent rather than the PEM. `-pubin` also means a
+# private key cannot be extracted here at all: openssl fails outright, which is
+# a stronger guard than the string check it replaces.
+n_hex="$(openssl rsa -pubin -in "$pem_file" -noout -modulus 2>/dev/null \
+    | sed 's/^Modulus=//' | tr 'A-Z' 'a-z')"
+e_dec="$(openssl rsa -pubin -in "$pem_file" -noout -text 2>/dev/null \
+    | sed -n 's/.*Exponent: \([0-9]*\) .*/\1/p')"
+
+if [ -z "$n_hex" ] || [ -z "$e_dec" ]; then
+    echo "could not read an RSA PUBLIC key from $pem_file" >&2
+    echo "  the attestation root must be a public key in PEM form" >&2
+    exit 1
+fi
+
+# Exponent as hex, even-length so it decodes as whole bytes.
+e_hex="$(printf '%x' "$e_dec")"
+if [ $(( ${#e_hex} % 2 )) -ne 0 ]; then e_hex="0${e_hex}"; fi
+
+SDK_BUILD_ENV="$env_target"
+SDK_ATTESTATION_KID="$kid"
+SDK_ATTESTATION_N="$n_hex"
+SDK_ATTESTATION_E="$e_hex"
+export SDK_BUILD_ENV SDK_ATTESTATION_KID SDK_ATTESTATION_N SDK_ATTESTATION_E
+
+echo "Building SDK (attestation target: ${env_target}, kid: ${kid})"
+
+if command -v squish >/dev/null 2>&1; then
+    "${script_dir}/build-ci"
+else
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      -e SDK_BUILD_ENV -e SDK_ATTESTATION_KID -e SDK_ATTESTATION_N -e SDK_ATTESTATION_E \
+      -v "${project_dir}:/repo" -w /repo \
+      ghcr.io/driverforge/anvil-lua:1.0.0 ./bin/build-ci
+fi
+
+# Local convenience only: refresh the example driver's vendored SDK so the
+# in-repo change is committed alongside. Skipped in CI ($CI set) — a CI build
+# must not mutate the checked-out source. Runs on the host either way: the
+# sibling example_driver/ isn't visible from inside the toolchain container.
+if [ -z "$CI" ] && [ -d "${project_dir}/../example_driver" ]; then
+    echo "Copying to example_driver (embeds the ${env_target} attestation key)..."
+    cp "${project_dir}/dist/driverforge-sdk.lua" "${project_dir}/../example_driver/src/vendor/"
+fi

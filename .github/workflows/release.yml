@@ -1,0 +1,251 @@
+name: Release
+run-name: Release — v${{ inputs.version }}
+
+# Cuts an SDK release from this repository, which is the public one. That is
+# deliberate and is the whole point: an attestation asserts "this workflow, at
+# this commit, produced these bytes", so it is only worth anything if the
+# workflow and the commit are ones a reader can go and look at. A release built
+# behind a closed door and signed by an unobservable process is trust by
+# assertion; this is trust you can check.
+#
+# The artifact is distributed from Azure, not from here — attestations bind to
+# the artifact digest rather than to where it is hosted, so a user verifies the
+# file they downloaded from releases.driverforge.com against an attestation
+# fetched from this repo.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SDK version to release (e.g., 1.2.0)'
+        required: true
+        type: string
+
+env:
+  AZURE_STORAGE_CONTAINER: driverforge-releases
+  ARTIFACT_PATH: driverforge-sdk
+  # The signing key's private half is non-exportable, so signing happens via the
+  # Key Vault API and no key material ever reaches the runner.
+  AZURE_KEY_VAULT: kmsgroup-keyvault
+  RELEASE_SIGNING_KEY: release-signing-v1
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # The federated credentials are pinned to
+    # repo:driverforge/control4-sdk:environment:release — Azure AD needs an
+    # exact subject and refs/tags/* is not expressible, so the environment is
+    # what binds this job to the signing identity. Its branch policy restricts
+    # deployments to main, so the only commits that can reach the signing key
+    # are ones the mirror sync put there — a branch pushed straight to this
+    # repository cannot build a release.
+    environment: release
+    permissions:
+      contents: write        # create the tag and the GitHub Release
+      id-token: write        # OIDC, for azure/login and for the attestation
+      attestations: write    # record the provenance statement
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: leafo/gh-actions-lua@35bcb06abec04ec87df82e08caa84d545348536e # v10
+        with:
+          luaVersion: "5.1"
+
+      - uses: leafo/gh-actions-luarocks@e65774a6386cb4f24e293dca7fc4ff89165b64c5 # v4
+
+      - name: Install dependencies
+        # The openssl rock is load-bearing for the test gate: without it the
+        # attestation specs self-gate and every real-crypto test silently
+        # skips. It is a spec-only dependency — the SDK itself has none.
+        run: |
+          luarocks install busted
+          luarocks install lua-cjson
+          luarocks install lbase64
+          luarocks install openssl
+
+      - name: Validate version format
+        run: |
+          VERSION="${{ inputs.version }}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$VERSION' does not match semver format X.Y.Z"
+            exit 1
+          fi
+
+      - name: Check tag does not already exist
+        run: |
+          TAG="v${{ inputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: busted spec/
+
+      - name: Build
+        run: ./bin/build
+
+      - name: Stage and package artifacts for publishing
+        run: |
+          VERSION="${{ inputs.version }}"
+          mkdir -p publish
+          cp dist/driverforge-sdk.lua publish/driverforge-sdk.lua
+          cd publish
+          zip "driverforge-sdk-${VERSION}.zip" driverforge-sdk.lua
+          rm driverforge-sdk.lua
+
+      # Attest the exact bytes that reach Azure. Any re-zip or repackaging after
+      # this point changes the digest and the attestation stops matching what a
+      # user downloads, so nothing may touch the file again.
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: publish/driverforge-sdk-${{ inputs.version }}.zip
+
+      - name: Stage the attestation bundle
+        # Published alongside the artifact so verification works offline, via
+        # `gh attestation verify --bundle`, without reaching the GitHub API.
+        run: |
+          VERSION="${{ inputs.version }}"
+          cp "${{ steps.attest.outputs.bundle-path }}" \
+            "publish/driverforge-sdk-${VERSION}.sigstore.json"
+
+      - name: Generate manifest
+        run: |
+          VERSION="${{ inputs.version }}"
+          BASE_URL="https://releases.driverforge.com/$AZURE_STORAGE_CONTAINER/$ARTIFACT_PATH/v$VERSION"
+          # Checksum the exact bytes that get uploaded. The CLI refuses to
+          # install an SDK whose manifest has no sha256, so this field is
+          # mandatory, not decorative. sha256sum emits lowercase hex.
+          #
+          # This is also the join between the two mechanisms: the attestation
+          # binds this digest to a build, the signature below binds it to a
+          # publisher. They answer different questions and neither replaces the
+          # other.
+          SHA256="$(sha256sum "publish/driverforge-sdk-${VERSION}.zip" | cut -d' ' -f1)"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "v$VERSION" \
+            --arg commit "$GITHUB_SHA" \
+            --arg releasedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg baseUrl "$BASE_URL" \
+            --arg sha256 "$SHA256" \
+            '{
+              version: $version,
+              tag: $tag,
+              commit: $commit,
+              releasedAt: $releasedAt,
+              artifacts: [
+                {
+                  name: "driverforge-sdk-\($version).zip",
+                  url: "\($baseUrl)/driverforge-sdk-\($version).zip",
+                  sha256: $sha256,
+                  contents: ["driverforge-sdk.lua"]
+                }
+              ]
+            }' \
+            > publish/manifest.json
+
+      - name: Authenticate to Azure for signing
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_RELEASE_SIGNER_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          # The identity holds one role: Key Vault Crypto User scoped to the
+          # signing key alone. It has no subscription-level reader, so asking
+          # for a subscription context would fail the login.
+          allow-no-subscriptions: true
+
+      - name: Sign the manifest
+        run: |
+          set -euo pipefail
+          # Sign the file exactly as uploaded. Re-serialising the JSON here
+          # would reorder keys and produce a signature the CLI rejects.
+          DIGEST="$(openssl dgst -sha256 -binary publish/manifest.json | base64)"
+          SIG="$(az keyvault key sign \
+            --vault-name "$AZURE_KEY_VAULT" \
+            --name "$RELEASE_SIGNING_KEY" \
+            --algorithm RS256 \
+            --digest "$DIGEST" \
+            --query signature -o tsv)"
+          jq -n \
+            --arg keyId "$RELEASE_SIGNING_KEY" \
+            --arg sig "$SIG" \
+            '{alg: "RS256", keyId: $keyId, sig: $sig}' \
+            > publish/manifest.json.sig
+
+      - name: Upload to Azure Blob Storage
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2
+        with:
+          inlineScript: |
+            VERSION="${{ inputs.version }}"
+            ZIP="publish/driverforge-sdk-${VERSION}.zip"
+            BUNDLE="publish/driverforge-sdk-${VERSION}.sigstore.json"
+            MANIFEST="publish/manifest.json"
+            SIGNATURE="publish/manifest.json.sig"
+
+            # Versioned path: immutable, filename includes version
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/v$VERSION/driverforge-sdk-${VERSION}.zip" \
+              -f "$ZIP" \
+              --content-cache-control "public, max-age=31536000, immutable" \
+              --overwrite
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/v$VERSION/driverforge-sdk-${VERSION}.sigstore.json" \
+              -f "$BUNDLE" \
+              --content-cache-control "public, max-age=31536000, immutable" \
+              --overwrite
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/v$VERSION/manifest.json" \
+              -f "$MANIFEST" \
+              --content-cache-control "public, max-age=31536000, immutable" \
+              --overwrite
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/v$VERSION/manifest.json.sig" \
+              -f "$SIGNATURE" \
+              --content-cache-control "public, max-age=31536000, immutable" \
+              --overwrite
+
+            # Latest path: no-cache, stable filename so direct-download URLs
+            # don't break between versions.
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/latest/driverforge-sdk-latest.zip" \
+              -f "$ZIP" \
+              --content-cache-control "no-cache, must-revalidate" \
+              --overwrite
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/latest/driverforge-sdk-latest.sigstore.json" \
+              -f "$BUNDLE" \
+              --content-cache-control "no-cache, must-revalidate" \
+              --overwrite
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/latest/manifest.json" \
+              -f "$MANIFEST" \
+              --content-cache-control "no-cache, must-revalidate" \
+              --overwrite
+            # latest/manifest.json is byte-identical to the versioned copy, so
+            # the same signature covers both.
+            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
+              -n "$ARTIFACT_PATH/latest/manifest.json.sig" \
+              -f "$SIGNATURE" \
+              --content-cache-control "no-cache, must-revalidate" \
+              --overwrite
+        env:
+          # Non-sensitive account name is a repo variable; only the key is a
+          # secret.
+          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+
+      - name: Create GitHub Release and tag
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: |
+            publish/driverforge-sdk-${{ inputs.version }}.zip
+            publish/driverforge-sdk-${{ inputs.version }}.sigstore.json

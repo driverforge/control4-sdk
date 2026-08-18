@@ -1,0 +1,7 @@
+.idea
+.DS_Store
+
+# Build output. The bundle carries the injected attestation public key + kid;
+# keeping it out of version control also stops a dev build, which embeds the
+# dev key, from being committed into this mirrored subtree.
+/dist

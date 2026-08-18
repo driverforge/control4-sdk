@@ -1,0 +1,16 @@
+-- Build-time version constant for the Anvil SDK.
+--
+-- Bumped on each release before `bin/build`. Once a driver is squished
+-- with this SDK and shipped to a customer controller, the only way to
+-- update the embedded harness is for the driver author to re-build with
+-- a newer SDK and ship a driver update — so the version embedded here
+-- is what drivers in the field will continue to report indefinitely
+-- after they're deployed.
+--
+-- Surfaced to the agent in every event/log/error envelope so Anvil can
+-- track which SDK versions are active across the deployed fleet.
+--
+-- A module return, deliberately not a global: the SDK must not write
+-- into the host driver's _G beyond the documented Anvil surface — a
+-- driver using SDK_VERSION for its own purposes would collide.
+return "1.0.0"
