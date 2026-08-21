@@ -2,7 +2,7 @@
 
 The library a Control4 driver vendors to talk to Driverforge. It captures errors, event timings and logs from the driver's Control4 event handlers and forwards them to the Anvil agent.
 
-This repository is the **SDK source** — it is for people working on the SDK itself. **To install and use the SDK in a driver, see the docs: <https://docs.driverforge.dev>.**
+This repository is the **SDK source** — it is for people working on the SDK itself. **To install and use the SDK in a driver, see the docs: <https://go.driverforge.com/sdk>.**
 
 Targets **Control4 OS 3.3.1 or newer**. Below that the SDK disables itself at load and the host driver runs exactly as it would with no SDK vendored, so a driver carrying it is safe to install anywhere.
 

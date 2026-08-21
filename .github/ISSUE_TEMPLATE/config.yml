@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: SDK documentation
-    url: https://docs.driverforge.dev
+    url: https://go.driverforge.com/docs
     about: Installing and using the SDK in a driver — start here for usage questions.
