@@ -15,7 +15,7 @@ mkdir -p dist
 squish --no-minify
 
 # Inject the attestation root PUBLIC key into the build OUTPUT at the sentinel
-# marker (DF-511). Committed source keeps an empty key map; only the built
+# marker. Committed source keeps an empty key map; only the built
 # bundle carries a key, so the dev key never lands in mirrored source. With no
 # key provided the bundle keeps the empty map and agent verification stays
 # disabled (the legacy discovery-trusts-filename behaviour).

@@ -9,7 +9,7 @@ set -e
 project_dir=$PWD
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 
-# Attestation key target (DF-511). The build injects an attestation root
+# Attestation key target. The build injects an attestation root
 # PUBLIC key into the OUTPUT bundle so the SDK can verify the agent's
 # identity; committed source stays key-less. Default is prod (the in-tree
 # key that mirrors to OSS); --dev / SDK_BUILD_ENV=dev embeds the dev key,
