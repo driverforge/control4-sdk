@@ -1,0 +1,39 @@
+# CI for the Anvil Control4 SDK.
+#
+# Runs on every pull request, including those from forks: the busted suite, then
+# a build of the squished harness.
+#
+# Reproduce either locally — the commands are the same ones CI runs:
+#
+#   busted spec/
+#   ./bin/build
+#
+# Both run in ghcr.io/driverforge/anvil-lua, the public driver-CI toolchain
+# image (Lua 5.1, LuaRocks, busted, squish), pinned so a pull request fails for
+# its own change rather than for a toolchain that moved.
+
+agents:
+  queue: linux-small-public
+
+steps:
+  - label: ':lua: Test'
+    key: test
+    notify:
+      - github_commit_status:
+          context: buildkite/test
+    timeout_in_minutes: 20
+    plugins: &lua
+      - docker#v5.11.0:
+          image: ghcr.io/driverforge/anvil-lua:1.0.0
+          environment:
+            - HOME=/tmp
+    command: busted spec/
+
+  - label: ':hammer: Build'
+    key: build
+    notify:
+      - github_commit_status:
+          context: buildkite/build
+    timeout_in_minutes: 15
+    plugins: *lua
+    command: ./bin/build
