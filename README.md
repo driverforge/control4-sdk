@@ -1,5 +1,7 @@
 # Driverforge Control4 SDK
 
+[![CI](https://badge.buildkite.com/13f54e0cbc941b049cfb50f2e2da70d92a1b26dac4c5514849.svg?branch=main)](https://buildkite.com/kmsgroup/control4-sdk)
+
 The library a Control4 driver vendors to talk to Driverforge. It captures errors, event timings and logs from the driver's Control4 event handlers and forwards them to the Anvil agent.
 
 This repository is the **SDK source** — it is for people working on the SDK itself. **To install and use the SDK in a driver, see the docs: <https://go.driverforge.com/sdk>.**
