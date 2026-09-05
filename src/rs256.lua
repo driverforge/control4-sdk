@@ -292,7 +292,7 @@ function M.verify(digest, signature, modulus, exponent)
             e = e * 256 + string.byte(exponent, i)
         end
     end
-    if type(e) ~= "number" or e < 3 or e % 2 == 0 or e > 2 ^ 32 then
+    if type(e) ~= "number" or e < 3 or e % 2 ~= 1 or e > 2 ^ 32 then
         return false, "unsupported exponent"
     end
 

@@ -139,6 +139,12 @@ describe('rs256', function()
             rejects('unsupported exponent', DIGEST, h(E65537.sig), h(E65537.n), 1)
         end)
 
+        it('rejects fractional and non-finite exponents', function()
+            for _, exponent in ipairs({ 3.5, 65537.5, 0 / 0, math.huge, -math.huge }) do
+                rejects('unsupported exponent', DIGEST, h(E3.sig), h(E3.n), exponent)
+            end
+        end)
+
         it('rejects a digest that is not sha-256 length', function()
             rejects('digest is not sha-256', 'abcd', h(E65537.sig), h(E65537.n), E65537.e)
         end)

@@ -1,0 +1,11 @@
+C2SP/Wycheproof RSA PKCS#1 v1.5 SHA-256 test vectors
+Upstream: https://github.com/C2SP/wycheproof
+Revision: 3fa63dd0344abb611f1fb1d77e119938603ea230
+Files copied verbatim from testvectors_v1/; LICENSE from the repository root.
+License: Apache-2.0 (see LICENSE). No upstream NOTICE file at this revision.
+
+SHA-256:
+58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd  LICENSE
+94a917b01ff50fb874cfc05bf29b4af44868d944a6558201cf18380da93fb393  rsa_signature_2048_sha256_test.json
+0f5f18cabfaad3e2792e82f7e9882f8999049b456714de924b8a5e202f61ca43  rsa_signature_3072_sha256_test.json
+957aca128e30bd02c8982f8ca482d6521d16683f4bbc3f193cdfd4c8f04bc667  rsa_signature_4096_sha256_test.json

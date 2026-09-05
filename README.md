@@ -34,6 +34,8 @@ With Lua 5.1 (or LuaJIT) and [LuaRocks](https://luarocks.org) installed, add the
 
 ```sh
 luarocks install busted
+luarocks install lua-cjson
+luarocks install openssl
 ```
 
 ### Build
@@ -51,6 +53,24 @@ busted spec/
 ```
 
 Pass a path to run a single spec file.
+
+The RS256 tests run pinned Wycheproof vectors, fresh OpenSSL signatures and
+bounded malformed inputs. OpenSSL is a test dependency; verification remains
+pure Lua. Missing test dependencies fail the conformance suite. To check the
+verifier on both supported runtimes (with the rocks available to each):
+
+```sh
+busted --lua=lua spec/rs256_spec.lua spec/rs256_conformance_spec.lua spec/rs256_fuzz_spec.lua
+busted --lua=luajit spec/rs256_spec.lua spec/rs256_conformance_spec.lua spec/rs256_fuzz_spec.lua
+```
+
+Corpus provenance and checksums are in `spec/fixtures/wycheproof/SOURCE.txt`.
+The tests require canonical RFC 8017 encoding and reject the corpus's legacy
+missing-NULL encoding. Passing these tests is not a cryptographic audit.
+
+The repeated conformance calculations temporarily suspend LuaCov's line hook;
+the ordinary verifier specs still collect coverage. Instrumenting every RSA
+arithmetic iteration across the corpus otherwise exceeds the CI time limit.
 
 ## License
 
