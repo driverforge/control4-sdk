@@ -1,5 +1,5 @@
 local Queue = require "queue"
-local STP = require "stacktrace"
+local Diagnostics = require "diagnostics"
 local AgentVerify = require "agent_verify"
 
 -- The C4 runtime is LuaJIT without 5.2 compat: table.unpack does not exist
@@ -13,6 +13,19 @@ local function pack(...)
     return { n = select('#', ...), ... }
 end
 
+-- Error transport requires a string, but inspecting an arbitrary error must
+-- never execute its __tostring metamethod. Runtime rethrows keep the original.
+local function errorText(value)
+    local kind = type(value)
+    if kind == "string" then return value end
+    if kind == "nil" or kind == "boolean" or kind == "number" then return tostring(value) end
+    return kind
+end
+
+local function failedTrace()
+    return { schemaVersion = 1, captureKind = "exception", status = "failed", reasons = { "capture_failed" } }
+end
+
 -- Marker for an error that an inner instrument() frame has ALREADY reported.
 -- When instrument re-raises a handler's error so the Director sees it (the
 -- non-mutation rule), a nested outer instrument frame would otherwise catch
@@ -22,16 +35,16 @@ end
 -- reaches the Director, so the driver still throws exactly what it would have
 -- unwrapped. Keyed by a private field, not the value's identity, so an error
 -- string interned elsewhere can't be mistaken for one of ours.
-local DF_REPORTED = "__dfReported"
+local DF_REPORTED = {}
 local function isReportedError(e)
-    return type(e) == "table" and e[DF_REPORTED] == true
+    return type(e) == "table" and rawget(e, DF_REPORTED) == true
 end
 local function tagReportedError(original)
     if isReportedError(original) then return original end
     return { [DF_REPORTED] = true, original = original }
 end
 local function unwrapReportedError(e)
-    if isReportedError(e) then return e.original end
+    if isReportedError(e) then return rawget(e, "original") end
     return e
 end
 
@@ -416,32 +429,9 @@ local _M = (function()
         return passed
     end
 
-    -- Drop a leading C 'error'/'assert' boundary frame from a stack captured
-    -- inside an instrument() message handler, so the trace starts at the
-    -- driver's own handler regardless of how the error was raised. A runtime
-    -- error has no such frame (the handler is already on top); an explicit
-    -- error()/assert() raise inserts one. Matches on the rendered frame text
-    -- (the dumper only retains {text, locals} per frame) — a plain substring,
-    -- not a pattern, so it can't misfire on a driver frame that merely
-    -- mentions "error".
-    function anvil:stripHandlerBoundaryFrame(stack)
-        local top = stack.frames and stack.frames[1]
-        if top and (top.text:find("C function 'error'", 1, true)
-                or top.text:find("C function 'assert'", 1, true)) then
-            table.remove(stack.frames, 1)
-        end
-    end
-
     function anvil:traceback(traceId, errorMessage, stackTrace)
-        print("Error occurred while executing event with trace ID: " .. traceId)
-        if not self._debugEnabled then
-            stackTrace:removeFrames(3)
-        end
-        self._eventStacktraces[traceId] = stackTrace:toJSON()
-        self._errorMessages[traceId] = errorMessage
-        -- Dumper:print prints and returns nothing; wrapping it in print()
-        -- would emit a stray blank line.
-        stackTrace:print()
+        self._eventStacktraces[traceId] = stackTrace
+        self._errorMessages[traceId] = errorText(errorMessage)
     end
 
     -- W3C-shaped hex id from a random UUID: strip hyphens, lowercase,
@@ -657,28 +647,13 @@ local _M = (function()
         self._ownedGlobals = globals
     end
 
-    -- Give StackTracePlus stable names for the frames the SDK reshapes, so a
-    -- traceback reads honestly instead of backwards. The harness takes over
-    -- the handler globals (OnPropertyChanged, ...), which leaves two naming
-    -- problems: (1) the driver's ORIGINAL handler is displaced out of _G, so
-    -- STP can't find a name for it and renders the driver's own frame — the
-    -- throw site — as `Lua function '?' (best guess)`; (2) the SDK WRAPPER now
-    -- answers to the handler's name, so STP labels the boundary frame as if it
-    -- were the driver's code. A reader then trusts the named wrapper (args
-    -- present) as their code and dismisses the anonymous `?` (their actual
-    -- code) as internals — exactly inverted.
-    --
-    -- Register the captured originals under their real handler name, and the
-    -- wrappers as an explicit boundary. We LABEL rather than hide: when the
-    -- fault is at the boundary (e.g. an arg lost crossing it) those frames are
-    -- the evidence, so a complete, correctly-labelled stack beats a trimmed
-    -- one. Call after the harness has installed its wrappers into _G.
+    -- Keep displaced driver handlers and SDK boundaries distinguishable.
     function anvil:nameHandlerFrames(globals)
         for name, original in pairs(self.EventHandlers) do
-            STP.add_known_function(original, name)
+            Diagnostics.registerFunction(original, { functionName = name, role = "driver" })
             local wrapper = globals[name]
             if wrapper and wrapper ~= original then
-                STP.add_known_function(wrapper, "[anvil boundary] " .. name)
+                Diagnostics.registerFunction(wrapper, { functionName = name, role = "sdk" })
             end
         end
     end
@@ -773,34 +748,20 @@ local _M = (function()
         local callArgs = pack(...)
 
         local startTime = C4:GetTime()
-        -- === Driver call: correct-by-construction. The only things between the
-        -- Director and the driver are this xpcall (needed to observe an error)
-        -- and an arg-preserving tail call — func's frame replaces the closure's,
-        -- so the level-2 capture still lands on the driver's handler. The
-        -- message handler does NOTHING that can mutate the driver's outcome: it
-        -- records the error value FIRST, so even if StackTracePlus throws below,
-        -- caughtError survives for the re-raise (xpcall then just returns false
-        -- with no usable stack — the driver's error is preserved and reported
-        -- frameless). The capture is inline, NOT wrapped in a nested pcall or
-        -- closure: those add frames and would push level 2 off the driver's own
-        -- handler. Level 2 is the errored handler's frame for a runtime error;
-        -- stripHandlerBoundaryFrame drops the extra C 'error'/'assert' frame an
-        -- explicit raise inserts. ===
-        local caughtError, caughtStack
+        -- Save the original error before diagnostics so capture failure cannot
+        -- replace it. Capture while the failing driver's frames are still live.
+        local caughtError, caughtStack, errorSaved
+        local function onError(errorMessage)
+            if errorSaved then return end
+            errorSaved = true
+            caughtError = errorMessage
+            if not isReportedError(errorMessage) then
+                caughtStack = Diagnostics.capture({ captureKind = "exception", boundary = onError })
+            end
+        end
         local results = pack(xpcall(function()
             return func(unpack(callArgs, 1, callArgs.n))
-        end, function(errorMessage)
-            caughtError = errorMessage
-            -- An error re-raised from an inner instrument frame is already
-            -- reported and already carries the accurate (pre-unwind) stack;
-            -- re-capturing here would only add this frame's misleading
-            -- post-unwind view. Skip it.
-            if not isReportedError(errorMessage) then
-                local stack = STP.stacktrace(errorMessage, 2)
-                self:stripHandlerBoundaryFrame(stack)
-                caughtStack = stack
-            end
-        end))
+        end, onError))
         local success, result = results[1], results[2]
         local endTime = C4:GetTime()
 
@@ -822,7 +783,8 @@ local _M = (function()
                 else
                     -- Stack capture failed (SDK-internal); still report the
                     -- error, just without frames.
-                    self._errorMessages[traceId] = caughtError
+                    self._errorMessages[traceId] = errorText(caughtError)
+                    self._eventStacktraces[traceId] = failedTrace()
                 end
             end
 
@@ -837,7 +799,7 @@ local _M = (function()
 
             -- Pre-generate errorId if there's an error (for bidirectional linking)
             local errorId = nil
-            if not success and self._errorMessages[traceId] then
+            if not success and not isReraise then
                 errorId = C4:UUID("RANDOM")
             end
 
@@ -863,7 +825,7 @@ local _M = (function()
 
             self:sendData(self:generateEventPayload(traceId, spanId, name, payloadArgs, startTime, endTime, endTime - startTime, success, payloadResult, payloadResults, nil, errorId, true))
 
-            if not success and self._errorMessages[traceId] then
+            if not success and not isReraise then
                 self:sendData(self:generateErrorPayload(
                     errorId, traceId, spanId, name, payloadArgs,
                     self._errorMessages[traceId], self._eventStacktraces[traceId]))
@@ -889,7 +851,7 @@ local _M = (function()
         -- The SDK observes; it must not mutate driver behaviour. Level 0: the
         -- original message already carries its position info.
         if not success then
-            if self._instrumentDepth > 0 then
+            if self._instrumentDepth > 0 or (self._timerDepth or 0) > 0 then
                 -- An outer instrument frame will catch this. Tag it so that
                 -- frame skips re-reporting the same throw (idempotent: an
                 -- already-tagged error passes through unchanged).
@@ -1006,54 +968,6 @@ local _M = (function()
         return event
     end
 
-    -- Simple hash function for fingerprinting (DJB2 algorithm)
-    local function hashString(str)
-        local hash = 5381
-        for i = 1, #str do
-            hash = ((hash * 33) + string.byte(str, i)) % 0xFFFFFFFF
-        end
-        return string.format("%08x", hash)
-    end
-
-    -- Generate fingerprint from stack trace (top 3 frames)
-    -- Returns a hash that groups similar errors together
-    function anvil:generateFingerprint(stacktrace, errorType, errorMessage)
-        local fingerprintParts = { errorType or "unknown" }
-
-        -- A table stacktrace is Dumper:toJSON() output: a bare array of
-        -- frames, each { text, locals }. Hash the top 3 frame texts only —
-        -- text pins the call site (function + file:line) while locals carry
-        -- runtime values that would fragment grouping.
-        if type(stacktrace) == "table" then
-            local frameCount = math.min(3, #stacktrace)
-            for i = 1, frameCount do
-                local frame = stacktrace[i]
-                if type(frame) == "table" and frame.text then
-                    table.insert(fingerprintParts, frame.text)
-                end
-            end
-        elseif type(stacktrace) == "string" then
-            -- Try to extract first 3 lines from string stacktrace
-            local lineCount = 0
-            for line in stacktrace:gmatch("[^\r\n]+") do
-                if lineCount < 3 then
-                    table.insert(fingerprintParts, line)
-                    lineCount = lineCount + 1
-                else
-                    break
-                end
-            end
-        end
-
-        -- If no stack frames, use sanitized error message (replace numbers with N)
-        if #fingerprintParts == 1 and errorMessage then
-            local sanitized = errorMessage:gsub("%d+", "N")
-            table.insert(fingerprintParts, sanitized)
-        end
-
-        return hashString(table.concat(fingerprintParts, "|"))
-    end
-
     -- Generate error payload for dedicated error tracking
     function anvil:generateErrorPayload(errorId, traceId, spanId, eventName, args, errorMessage, stacktrace)
         local payload = {}
@@ -1065,14 +979,11 @@ local _M = (function()
         payload["spanId"] = spanId
         payload["eventName"] = eventName
         payload["type"] = "lua:runtime_error"
-        payload["value"] = errorMessage
-        payload["stacktrace"] = stacktrace
+        payload["value"] = errorText(errorMessage)
+        payload["stacktrace"] = stacktrace or failedTrace()
         payload["args"] = args
         payload["driverVersion"] = self._driverVersion
         payload["createdAt"] = C4:GetTime()
-
-        -- Generate fingerprint for error grouping
-        payload["fingerprint"] = self:generateFingerprint(stacktrace, payload["type"], errorMessage)
 
         if traceId and self._eventLastLogs[traceId] then
             payload["lastLog"] = self._eventLastLogs[traceId]
@@ -1083,23 +994,18 @@ local _M = (function()
 
     -- Manual error capture for non-instrumented contexts (timers, URL callbacks, etc.)
     -- errorMessage: string - the error message
-    -- stacktrace: stacktrace object or nil - if nil, capture at call site
+    -- stacktrace: structured trace or nil - if nil, capture at call site
     -- context: table|nil - optional {eventName, args, traceId, spanId} for grouping
     function anvil:captureError(errorMessage, stacktrace, context)
-        local stack = stacktrace or STP.stacktrace(errorMessage, 2)
+        if self._instrumentationDisabled or (self._hasLateInited and not self:isAgentInstalled()) then return end
         local ctx = context or {}
-
-        local errorPayload = self:generateErrorPayload(
-            nil,                            -- errorId (auto-generate for manual captures)
-            ctx.traceId,                    -- nil → generateErrorPayload mints a fresh root trace
-            ctx.spanId,                     -- nil → fresh root span
-            ctx.eventName or "ManualCapture",
-            ctx.args or {},
-            errorMessage,
-            stack:toJSON()
-        )
-        self:sendData(errorPayload)
-        self:debug("Manual error captured: ", tostring(errorMessage))
+        self:runSdkWork("captureError", function()
+            local stack = stacktrace or Diagnostics.capture({ captureKind = "callsite", boundary = anvil.captureError })
+            self:sendData(self:generateErrorPayload(
+                nil, ctx.traceId, ctx.spanId, ctx.eventName or "ManualCapture",
+                ctx.args or {}, errorMessage, stack
+            ))
+        end)
     end
 
     function anvil:forwardLog(logLevel, message)
@@ -1133,51 +1039,59 @@ local _M = (function()
     -- callback: function - the callback function to execute
     -- ...: any additional arguments to pass to C4:SetTimer
     function anvil:setTimer(duration, callback, ...)
+        if self._instrumentationDisabled then return C4:SetTimer(duration, callback, ...) end
         local extraArgs = pack(...)
+        local timerName = "Timer"
+        -- Keep the callback wrapper so an agent installed later can receive
+        -- future errors, but do no diagnostic work while an agent is absent.
+        if not (self._hasLateInited and not self:isAgentInstalled()) then
+            pcall(function()
+                -- This closure and pcall add two frames above setTimer.
+                local callerInfo = debug.getinfo(4, "Sl")
+                if callerInfo then
+                    timerName = string.format("Timer@%s:%d", callerInfo.short_src, callerInfo.currentline)
+                end
+            end)
+        end
 
-        -- Capture caller location at timer creation time for error context
-        local callerInfo = debug.getinfo(2, "Sl")
-        local source = callerInfo and callerInfo.short_src or "unknown"
-        local line = callerInfo and callerInfo.currentline or 0
-        local timerName = string.format("Timer@%s:%d", source, line)
-
-        return C4:SetTimer(duration, function(timer, ...)
-            local callbackArgs = pack(timer, ...)  -- Capture args before nested function
-            local errorInfo = nil
+        local function timerCallback(timer, ...)
+            if self._instrumentationDisabled or (self._hasLateInited and not self:isAgentInstalled()) then
+                return callback(timer, ...)
+            end
+            self._timerDepth = (self._timerDepth or 0) + 1
+            local callbackArgs = pack(timer, ...)
+            local caughtError, caughtStack, errorSaved
+            local function onError(e)
+                if errorSaved then return end
+                errorSaved = true
+                caughtError = e
+                if not isReportedError(e) then
+                    caughtStack = Diagnostics.capture({ captureKind = "exception", boundary = onError })
+                end
+            end
             local results = pack(xpcall(function()
                 return callback(unpack(callbackArgs, 1, callbackArgs.n))
-            end, function(e)
-                -- Capture stack trace at error time (before unwinding)
-                errorInfo = {
-                    message = e,
-                    stack = STP.stacktrace(e, 2)
-                }
-            end))
+            end, onError))
 
+            self._timerDepth = self._timerDepth - 1
             if not results[1] then
-                if errorInfo then
-                    local errorPayload = self:generateErrorPayload(
-                        nil,                    -- errorId (auto-generate for timers)
-                        nil,                    -- traceId — not a C4 event, mint a fresh root trace
-                        nil,                    -- spanId — fresh root span
-                        timerName,              -- use caller location as event name
-                        {},                     -- no args
-                        errorInfo.message,
-                        errorInfo.stack:toJSON()
-                    )
-                    self:sendData(errorPayload)
-                    self:debug("Timer error captured: ", timerName)
+                if not isReportedError(caughtError) then
+                    self:runSdkWork("timer", function()
+                        self:sendData(self:generateErrorPayload(
+                            nil, nil, nil, timerName, {}, caughtError, caughtStack
+                        ))
+                    end)
                 end
-
-                -- Report-then-re-raise: an unwrapped C4:SetTimer callback's
-                -- error propagates into the Director, so ours must too — not
-                -- get swallowed with the error message handed back as the
-                -- callback's return value.
-                error(errorInfo and errorInfo.message, 0)
+                if (self._instrumentDepth or 0) > 0 or self._timerDepth > 0 then
+                    error(tagReportedError(caughtError), 0)
+                end
+                error(unwrapReportedError(caughtError), 0)
             end
 
             return unpack(results, 2, results.n)
-        end, unpack(extraArgs, 1, extraArgs.n))
+        end
+        Diagnostics.registerFunction(timerCallback, { functionName = "timerCallback", role = "sdk" })
+        return C4:SetTimer(duration, timerCallback, unpack(extraArgs, 1, extraArgs.n))
     end
 
     function anvil:start()
@@ -1636,6 +1550,13 @@ local _M = (function()
             .. " driver will run uninstrumented.")
     end
 
+    -- Identify SDK frames by function identity, including helpers that can
+    -- appear beneath a driver callback. Never infer ownership from filenames.
+    for name, fn in pairs(anvil) do
+        if type(fn) == "function" then
+            Diagnostics.registerFunction(fn, { functionName = name, role = "sdk" })
+        end
+    end
     return anvil
 end)()
 

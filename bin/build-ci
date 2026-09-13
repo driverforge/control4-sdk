@@ -11,7 +11,7 @@ mkdir -p dist
 # Squish src/ into a single Lua module (dist/driverforge-sdk.lua). The SDK is open
 # source (MIT) and ships as readable Lua — there is no obfuscation step.
 # --no-minify keeps the published artifact human-readable and preserves the
-# inline third-party license headers (e.g. StackTracePlus).
+# inline license headers.
 squish --no-minify
 
 # Inject the attestation root PUBLIC key into the build OUTPUT at the sentinel

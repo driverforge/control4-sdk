@@ -53,7 +53,7 @@ For anything beyond a trivial fix, please open an issue first describing the bug
 - `if condition then`, not `if(condition) then`.
 - Collect varargs with `select('#', ...)`, never `#{...}` — an embedded nil must not truncate the list.
 - Library code must not `print` on non-error paths; error-path prints are deliberate (they surface in the Composer Lua output).
-- `stacktrace.lua` is a vendored copy of a shared module — its canonical source lives in the private monorepo, so PRs editing it directly will be re-rooted during import; flag it in the PR description and expect the maintainer to handle placement.
+- `diagnostics.lua` is a vendored copy of a shared module — its canonical source lives in the private monorepo, so PRs editing it directly will be re-rooted during import; flag it in the PR description and expect the maintainer to handle placement.
 
 The test suite uses [busted](https://lunarmodules.github.io/busted/):
 

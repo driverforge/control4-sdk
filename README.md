@@ -14,7 +14,7 @@ MIT licensed.
 
 | Path | |
 | --- | --- |
-| `src/` | SDK sources — `harness.lua` (the public `Driverforge` and `Anvil` API), `client.lua` (core client), `agent_verify.lua`, `rs256.lua`, `queue.lua`, `stacktrace.lua`, `version.lua` |
+| `src/` | SDK sources — `harness.lua` (the public `Driverforge` and `Anvil` API), `client.lua` (core client), `agent_verify.lua`, `rs256.lua`, `queue.lua`, `diagnostics.lua`, `version.lua` |
 | `spec/` | [busted](https://lunarmodules.github.io/busted/) test suite |
 | `bin/` | build tooling — `bin/build` bundles `src/` into a single `dist/driverforge-sdk.lua` |
 | `squishy` | squish manifest |
@@ -74,7 +74,7 @@ arithmetic iteration across the corpus otherwise exceeds the CI time limit.
 
 ## License
 
-[MIT](LICENSE). Bundles a modified copy of StackTracePlus — see [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES.md).
+[MIT](LICENSE). Test-fixture licenses are listed in [THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES.md).
 
 ## Contributing
 

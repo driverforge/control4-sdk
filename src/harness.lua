@@ -1,4 +1,5 @@
 local anvil = require 'client'
+local Diagnostics = require 'diagnostics'
 -- Module return, kept out of the host driver's _G. pcall so an odd
 -- embedding without the version module degrades to "unknown" instead of
 -- failing the whole harness load.
@@ -79,7 +80,7 @@ Anvil = Anvil or {
 
     -- Manual error capture for non-instrumented contexts (timers, URL callbacks, etc.)
     -- @param errorMessage: string - the error message
-    -- @param stacktrace: stacktrace object or nil - if nil, capture at call site
+    -- @param stacktrace: structured trace or nil - if nil, capture at call site
     -- @param context: table|nil - optional {eventName, args, traceId, spanId} for grouping
     CaptureError = function(self, errorMessage, stacktrace, context)
         anvil:captureError(errorMessage, stacktrace, context)
@@ -198,7 +199,9 @@ anvil:registerOwnedGlobals({
     ExecuteCommand = ExecuteCommand,
 })
 
--- Now that every wrapper is installed in _G, hand StackTracePlus the names
+Diagnostics.registerFunction(Anvil.CaptureError, { skip = true })
+
+-- Now that every wrapper is installed in _G, register the names
 -- for the frames the SDK reshaped: the driver's displaced originals (so the
 -- throw site is named, not `?`) and the wrappers (labelled as the boundary).
 -- Built here because only the harness knows which _G globals it now owns.

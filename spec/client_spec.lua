@@ -1,3 +1,4 @@
+local withDebugStubs = require 'spec.support.with_debug_stubs'
 describe('anvil', function()
     -- C4 globals aren't loaded in the spec runner. Stub the calls anvil.lua
     -- actually makes during the codepaths under test (mostly GetUniqueMAC
@@ -180,12 +181,12 @@ describe('anvil', function()
     describe('generateErrorPayload', function()
         before_each(function() stubC4() end)
 
-        it('builds an error envelope with own id, traceId/spanId, value, and fingerprint', function()
+        it('builds an error envelope with own id, traceId/spanId, value, and structured trace', function()
             local anvil = freshAnvil()
             local envelope = anvil:generateErrorPayload(
                 'err-1', 'trace-1', 'span-1', 'OnDriverInit', {},
                 'something failed',
-                'short trace'
+                { schemaVersion = 1, captureKind = 'exception', status = 'complete' }
             )
 
             assert.are.equal('error', envelope.eventType)
@@ -200,14 +201,27 @@ describe('anvil', function()
             assert.are.equal('lua:runtime_error', envelope.payload.type)
             assert.are.equal('something failed', envelope.payload.value)
             assert.are.equal('0.1.0', envelope.payload.driverVersion)
-            assert.is_string(envelope.payload.fingerprint)
+            assert.is_nil(envelope.payload.fingerprint)
+        end)
+
+        it('normalizes primitive and opaque errors without calling metamethods', function()
+            local anvil = freshAnvil()
+            local opaque = setmetatable({}, { __tostring = function() error('must not run') end })
+            for _, example in ipairs({ { value = nil, expected = 'nil' }, { value = false, expected = 'false' },
+                { value = 42, expected = '42' }, { value = opaque, expected = 'table' },
+                { value = function() end, expected = 'function' } }) do
+                local envelope = anvil:generateErrorPayload(nil, nil, nil, 'Manual', {}, example.value, nil)
+                assert.are.equal(example.expected, envelope.payload.value)
+                assert.are.equal(1, envelope.payload.stacktrace.schemaVersion)
+                assert.are.equal('failed', envelope.payload.stacktrace.status)
+            end
         end)
 
         it('auto-generates an errorId when not supplied', function()
             local anvil = freshAnvil()
             _G.C4.UUID = function() return 'auto-uuid' end
 
-            local envelope = anvil:generateErrorPayload(nil, 'trace-1', 'span-1', 'X', {}, 'msg', 't')
+            local envelope = anvil:generateErrorPayload(nil, 'trace-1', 'span-1', 'X', {}, 'msg', nil)
 
             assert.are.equal('auto-uuid', envelope.payload.id)
         end)
@@ -216,7 +230,7 @@ describe('anvil', function()
             local anvil = freshAnvil()
             -- No trace/span supplied (timer / manual capture): the error
             -- becomes its own root trace with no enclosing span.
-            local envelope = anvil:generateErrorPayload('err-1', nil, nil, 'Timer', {}, 'msg', 't')
+            local envelope = anvil:generateErrorPayload('err-1', nil, nil, 'Timer', {}, 'msg', nil)
 
             assert.is_truthy(envelope.payload.traceId:match('^%x+$'))
             assert.are.equal(32, #envelope.payload.traceId)
@@ -227,88 +241,9 @@ describe('anvil', function()
             local anvil = freshAnvil()
             anvil._eventLastLogs['trace-1'] = 'last log'
 
-            local envelope = anvil:generateErrorPayload('err-1', 'trace-1', 'span-1', 'X', {}, 'msg', 't')
+            local envelope = anvil:generateErrorPayload('err-1', 'trace-1', 'span-1', 'X', {}, 'msg', nil)
 
             assert.are.equal('last log', envelope.payload.lastLog)
-        end)
-    end)
-
-    describe('generateFingerprint', function()
-        before_each(function() stubC4() end)
-
-        local STP = require 'stacktrace'
-
-        -- Traces exactly as production hands them to generateFingerprint:
-        -- Dumper:toJSON(), a bare array of { text, locals } frames. Two
-        -- distinct capture sites so their top frames differ.
-        local function captureAtSiteA(message)
-            return STP.stacktrace(message, 1):toJSON()
-        end
-
-        local function captureAtSiteB(message)
-            return STP.stacktrace(message, 1):toJSON()
-        end
-
-        -- Frame text pins call sites by file:line, so captures meant to be
-        -- identical must share every call line: loop rather than repeat the
-        -- call, otherwise the differing test line shows up in the trace.
-        local function captureTwiceAtSiteA(message1, message2)
-            local traces = {}
-            for _, message in ipairs({ message1, message2 }) do
-                traces[#traces + 1] = captureAtSiteA(message)
-            end
-            return traces[1], traces[2]
-        end
-
-        it('produces a stable hex hash for the same call site', function()
-            local anvil = freshAnvil()
-            local traceA, traceB = captureTwiceAtSiteA('msg', 'msg')
-            local a = anvil:generateFingerprint(traceA, 'lua:runtime_error', 'msg')
-            local b = anvil:generateFingerprint(traceB, 'lua:runtime_error', 'msg')
-
-            assert.are.equal(a, b)
-            assert.is_truthy(a:match('^%x+$'))
-        end)
-
-        it('distinguishes different call sites raising the same message', function()
-            local anvil = freshAnvil()
-            local a = anvil:generateFingerprint(captureAtSiteA('msg'), 'lua:runtime_error', 'msg')
-            local b = anvil:generateFingerprint(captureAtSiteB('msg'), 'lua:runtime_error', 'msg')
-
-            assert.are_not.equal(a, b)
-        end)
-
-        it('ignores captured locals so runtime values do not fragment grouping', function()
-            local anvil = freshAnvil()
-            -- Same call chain, different runtime values in scope: only
-            -- frame text may contribute to the hash, never dumped locals.
-            local traceA, traceB = captureTwiceAtSiteA('first value', 'second value')
-            local a = anvil:generateFingerprint(traceA, 'lua:runtime_error', 'msg')
-            local b = anvil:generateFingerprint(traceB, 'lua:runtime_error', 'msg')
-
-            assert.are.equal(a, b)
-        end)
-
-        it('sanitises numeric chars in error message when no stack frames', function()
-            local anvil = freshAnvil()
-            -- Different IDs should still hash to the same fingerprint so
-            -- ingestion can group errors that differ only in transient ids.
-            local a = anvil:generateFingerprint(nil, 'lua:runtime_error', 'failed for id 42')
-            local b = anvil:generateFingerprint(nil, 'lua:runtime_error', 'failed for id 99')
-
-            assert.are.equal(a, b)
-        end)
-
-        it('parses string stacktraces, taking the first three lines', function()
-            local anvil = freshAnvil()
-            local trace = 'frame1\nframe2\nframe3\nframe4'
-            local extended = 'frame1\nframe2\nframe3\nDIFFERENT'
-
-            -- The fourth line shouldn't influence the hash.
-            assert.are.equal(
-                anvil:generateFingerprint(trace, 'lua:runtime_error', 'msg'),
-                anvil:generateFingerprint(extended, 'lua:runtime_error', 'msg')
-            )
         end)
     end)
 
@@ -529,11 +464,13 @@ describe('anvil', function()
             assert.are.equal(event.payload.traceId, errorEnvelope.payload.traceId)
             assert.are.equal(event.payload.spanId, errorEnvelope.payload.spanId)
             assert.are.equal('OnBindingChanged', errorEnvelope.payload.eventName)
-            assert.is_string(errorEnvelope.payload.fingerprint)
+            assert.is_nil(errorEnvelope.payload.fingerprint)
 
-            -- The stacktrace is the real toJSON() shape: frames carrying text.
+            -- Diagnostic frames carry source fields, without presentation text.
             assert.is_table(errorEnvelope.payload.stacktrace)
-            assert.is_string(errorEnvelope.payload.stacktrace[1].text)
+            assert.are.equal(1, errorEnvelope.payload.stacktrace.schemaVersion)
+            assert.is_string(errorEnvelope.payload.stacktrace.frames[1].source.name)
+            assert.is_nil(errorEnvelope.payload.stacktrace.frames[1].text)
         end)
 
         -- The captured stacktrace must start at the driver's own handler, not
@@ -550,7 +487,7 @@ describe('anvil', function()
                 anvil:instrument('OnBindingChanged', raise)
             end)
             local errorEnvelope = sent[2]
-            return errorEnvelope.payload.stacktrace[1].text
+            return errorEnvelope.payload.stacktrace.frames[1]
         end
 
         it('starts the stacktrace at the driver handler for a runtime error', function()
@@ -558,70 +495,97 @@ describe('anvil', function()
                 local x = nil
                 return x.field  -- nil index: no error() C frame
             end)
-            assert.is_truthy(top:find('client_spec.lua', 1, true))
-            assert.is_falsy(top:find('/client.lua', 1, true))
-            assert.is_falsy(top:find("C function", 1, true))
-            assert.is_falsy(top:find('instrument', 1, true))
+            assert.is_truthy(top.source.name:find('client_spec.lua', 1, true))
+            assert.are.equal('lua', top.kind)
         end)
 
         it('starts the stacktrace at the driver handler for an error() raise', function()
             local top = topFrameFor(function() error('boom') end)
-            assert.is_truthy(top:find('client_spec.lua', 1, true))
-            assert.is_falsy(top:find("C function 'error'", 1, true))
+            assert.is_truthy(top.source.name:find('client_spec.lua', 1, true))
+            assert.are.equal('lua', top.kind)
         end)
 
-        -- assert() is not integration-tested here: under busted the global
-        -- `assert` is luassert (a Lua function), so it can't reproduce the
-        -- built-in C 'assert' boundary frame a real controller produces. Unit
-        -- test the strip against synthetic frames instead — deterministic and
-        -- interpreter-independent.
-        it('stripHandlerBoundaryFrame drops a leading C error/assert frame only', function()
-            local anvil = freshAnvil()
-
-            local function top(text)
-                local stack = { frames = { { text = text }, { text = "Lua function '?' in 'driver.lua:1'" } } }
-                anvil:stripHandlerBoundaryFrame(stack)
-                return stack.frames[1].text
-            end
-
-            -- Boundary frames are stripped, exposing the handler beneath.
-            assert.is_truthy(top("global C function 'error'"):find('driver.lua', 1, true))
-            assert.is_truthy(top("global C function 'assert'"):find('driver.lua', 1, true))
-            -- A driver frame that merely mentions "error" is left untouched.
-            assert.is_truthy(top("Lua function 'onError' in 'driver.lua:9'"):find('onError', 1, true))
-        end)
-
-        -- The harness displaces the driver's handler out of _G (the wrapper
-        -- takes over the name), so without help StackTracePlus renders the
-        -- driver's own frame — the throw site — as an anonymous `?` and names
-        -- the wrapper as if it were driver code. nameHandlerFrames restores
-        -- honest labelling.
         it('names the displaced driver handler frame, not the wrapper', function()
             local anvil, sent = instrumentedAnvil()
-
             local function driverHandler() local x = nil; return x.field end
             anvil.EventHandlers = { OnPropertyChanged = driverHandler }
             anvil:nameHandlerFrames({ OnPropertyChanged = function() end })
-
             pcall(function() anvil:instrument('OnPropertyChanged', driverHandler) end)
-
-            local top = sent[2].payload.stacktrace[1].text
-            assert.is_truthy(top:find("'OnPropertyChanged'", 1, true))  -- named, not '?'
-            assert.is_falsy(top:find('best guess', 1, true))
-            assert.is_falsy(top:find('anvil boundary', 1, true))        -- driver frame, not the wrapper
+            local top = sent[2].payload.stacktrace.frames[1]
+            assert.are.equal('OnPropertyChanged', top.functionName)
+            assert.are.equal('registered', top.nameOrigin)
+            assert.are.equal('driver', top.role)
         end)
 
-        it('labels the SDK wrapper frame as the anvil boundary', function()
+        it('labels the SDK wrapper frame as a boundary', function()
             local anvil = instrumentedAnvil()
-            local STP = require 'stacktrace'
-
+            local Diagnostics = require 'diagnostics'
             local wrapper = function() local x = nil; return x.field end
             anvil.EventHandlers = { OnPropertyChanged = function() end }
             anvil:nameHandlerFrames({ OnPropertyChanged = wrapper })
-
             local top
-            xpcall(wrapper, function(e) top = STP.stacktrace(e, 2).frames[1].text end)
-            assert.is_truthy(top:find('[anvil boundary] OnPropertyChanged', 1, true))
+            local function onError()
+                top = Diagnostics.capture({ captureKind = 'exception', boundary = onError }).frames[1]
+            end
+            xpcall(wrapper, onError)
+            assert.are.equal('OnPropertyChanged', top.functionName)
+            assert.are.equal('sdk', top.role)
+        end)
+
+        it('marks the instrument boundary as SDK-owned using function identity', function()
+            local anvil, sent = instrumentedAnvil()
+            pcall(function() anvil:instrument('OnPropertyChanged', function() error('driver error') end) end)
+            local found = false
+            for _, frame in ipairs(sent[2].payload.stacktrace.frames) do
+                if frame.functionName == 'instrument' then
+                    found = true
+                    assert.are.equal('sdk', frame.role)
+                    assert.are.equal('registered', frame.nameOrigin)
+                end
+            end
+            assert.is_true(found)
+        end)
+
+        it('preserves hostile table errors without invoking their metamethods', function()
+            local anvil, sent = instrumentedAnvil()
+            local thrown = setmetatable({ __dfReported = true }, {
+                __index = function() error('must not index') end,
+                __tostring = function() error('must not stringify') end,
+            })
+            local ok, err = pcall(function()
+                anvil:instrument('OnDriverInit', function()
+                    anvil:instrument('OnPropertyChanged', function() error(thrown, 0) end)
+                end)
+            end)
+            assert.is_false(ok)
+            assert.are.equal(thrown, err)
+            local reports = 0
+            for _, envelope in ipairs(sent) do
+                if envelope.eventType == 'error' then
+                    reports = reports + 1
+                    assert.are.equal('table', envelope.payload.value)
+                end
+            end
+            assert.are.equal(1, reports)
+        end)
+
+        it('retains original nil, false and table errors when diagnostic capture throws', function()
+            local Diagnostics = require 'diagnostics'
+            local originalCapture = Diagnostics.capture
+            for _, box in ipairs({ { value = nil }, { value = false }, { value = {} } }) do
+                local anvil, sent = instrumentedAnvil()
+                Diagnostics.capture = function() error('diagnostics failed', 0) end
+                local ok, err = pcall(function()
+                    anvil:instrument('OnPropertyChanged', function() error(box.value, 0) end)
+                end)
+                Diagnostics.capture = originalCapture
+                assert.is_false(ok)
+                assert.are.equal(box.value, err)
+                assert.are.equal('error', sent[2].eventType)
+                assert.are.equal(type(box.value) == 'table' and 'table' or tostring(box.value), sent[2].payload.value)
+                assert.are.equal('failed', sent[2].payload.stacktrace.status)
+                assert.are.same({ 'capture_failed' }, sent[2].payload.stacktrace.reasons)
+            end
         end)
 
         -- Containment: SDK-internal telemetry work is isolated, so a failure
@@ -1198,7 +1162,7 @@ describe('anvil', function()
             local sent = {}
             anvil.sendData = function(_, payload) table.insert(sent, payload) end
 
-            local fakeStack = { toJSON = function() return { 'frame' } end }
+            local fakeStack = { schemaVersion = 1, captureKind = 'callsite', status = 'complete' }
             anvil:captureError('manual error', fakeStack, { eventName = 'Manual', args = {} })
 
             assert.are.equal(1, #sent)
@@ -1206,6 +1170,32 @@ describe('anvil', function()
             assert.are.equal('manual error', sent[1].payload.value)
             assert.are.equal('Manual', sent[1].payload.eventName)
         end)
+        it('captures the manual reporting callsite as structured data', function()
+            local anvil = freshAnvil()
+            local sent
+            anvil.sendData = function(_, payload) sent = payload end
+            anvil:captureError('manual report')
+            assert.are.equal('callsite', sent.payload.stacktrace.captureKind)
+            assert.is_truthy(sent.payload.stacktrace.frames[1].source.name:find('client_spec.lua', 1, true))
+        end)
+
+        it('does not capture or submit when disabled or an agent is absent', function()
+            local anvil = freshAnvil()
+            local Diagnostics = require 'diagnostics'
+            local originalCapture = Diagnostics.capture
+            local calls = 0
+            Diagnostics.capture = function() calls = calls + 1 end
+            anvil.sendData = function() calls = calls + 1 end
+            anvil._instrumentationDisabled = true
+            anvil:captureError('ignored')
+            anvil._instrumentationDisabled = false
+            anvil._hasLateInited = true
+            anvil.isAgentInstalled = function() return false end
+            anvil:captureError('ignored')
+            Diagnostics.capture = originalCapture
+            assert.are.equal(0, calls)
+        end)
+
     end)
 
     describe('SetTimer', function()
@@ -1272,7 +1262,119 @@ describe('anvil', function()
             assert.are.equal('error', sent[1].eventType)
             assert.is_truthy(sent[1].payload.value:match('timer exploded'))
             assert.is_truthy(sent[1].payload.eventName:match('^Timer@'))
-            assert.is_string(sent[1].payload.fingerprint)
+            assert.is_nil(sent[1].payload.fingerprint)
+        end)
+
+        it('marks the timer callback wrapper as SDK-owned', function()
+            local anvil = freshAnvil()
+            local sent
+            anvil.sendData = function(_, payload) sent = payload end
+            pcall(function() anvil:setTimer(20, function() error('driver timer error') end) end)
+            local found = false
+            for _, frame in ipairs(sent.payload.stacktrace.frames) do
+                if frame.functionName == 'timerCallback' then
+                    found = true
+                    assert.are.equal('sdk', frame.role)
+                    assert.are.equal('registered', frame.nameOrigin)
+                end
+            end
+            assert.is_true(found)
+        end)
+
+        it('preserves nil, false and table errors when capture or submission fails', function()
+            local Diagnostics = require 'diagnostics'
+            local originalCapture = Diagnostics.capture
+            local values = { { value = nil }, { value = false }, { value = {} } }
+            for _, failure in ipairs({ 'capture', 'submission' }) do
+                for _, box in ipairs(values) do
+                    local anvil = freshAnvil()
+                    anvil.reportSdkFault = function() end
+                    Diagnostics.capture = failure == 'capture' and function() error('capture failed') end or originalCapture
+                    anvil.sendData = function() error('submission failed') end
+                    local ok, err = pcall(function()
+                        anvil:setTimer(50, function() error(box.value, 0) end)
+                    end)
+                    Diagnostics.capture = originalCapture
+                    assert.is_false(ok)
+                    assert.are.equal(box.value, err)
+                end
+            end
+        end)
+
+        it('bypasses capture at callback time when instrumentation is inactive', function()
+            local anvil = freshAnvil()
+            local callback
+            C4.SetTimer = function(_, _, fn) callback = fn end
+            anvil:setTimer(50, function() error('driver failure', 0) end)
+            anvil._hasLateInited = true
+            anvil.isAgentInstalled = function() return false end
+            local Diagnostics = require 'diagnostics'
+            local originalCapture = Diagnostics.capture
+            local captures = 0
+            Diagnostics.capture = function() captures = captures + 1 end
+            local ok, err = pcall(callback, {})
+            Diagnostics.capture = originalCapture
+            assert.is_false(ok)
+            assert.are.equal('driver failure', err)
+            assert.are.equal(0, captures)
+        end)
+
+        it('reports errors through nested timers and handlers only once', function()
+            for _, withHandler in ipairs({ false, true }) do
+                local anvil = freshAnvil()
+                local sent = {}
+                anvil.sendData = function(_, payload)
+                    if payload.eventType == 'error' then sent[#sent + 1] = payload end
+                end
+                local thrown = {}
+                local ok, err = pcall(function()
+                    anvil:setTimer(50, function()
+                        local function inner()
+                            anvil:setTimer(20, function() error(thrown, 0) end)
+                        end
+                        if withHandler then anvil:instrument('OnPropertyChanged', inner)
+                        else inner() end
+                    end)
+                end)
+                assert.is_false(ok)
+                assert.are.equal(thrown, err)
+                assert.are.equal(1, #sent)
+                assert.are.equal(0, anvil._timerDepth)
+                assert.are.equal(0, anvil._instrumentDepth or 0)
+            end
+        end)
+
+        it('skips registration diagnostics without an agent and captures future timer errors', function()
+            local anvil = freshAnvil()
+            anvil._hasLateInited = true
+            local installed = false
+            anvil.isAgentInstalled = function() return installed end
+            local callback, sent
+            C4.SetTimer = function(_, _, fn) callback = fn end
+            anvil.sendData = function(_, payload) sent = payload end
+            local calls = 0
+            withDebugStubs({
+                getinfo = function() calls = calls + 1; error('debug unavailable') end,
+            }, function()
+                anvil:setTimer(20, function() error('later failure', 0) end)
+            end)
+            assert.are.equal(0, calls)
+            installed = true
+            local ok, err = pcall(callback, {})
+            assert.is_false(ok)
+            assert.are.equal('later failure', err)
+            assert.are.equal('error', sent.eventType)
+        end)
+
+        it('still schedules a timer when caller metadata capture fails', function()
+            local anvil = freshAnvil()
+            local called = false
+            withDebugStubs({
+                getinfo = function() error('debug unavailable') end,
+            }, function()
+                anvil:setTimer(20, function() called = true end)
+            end)
+            assert.is_true(called)
         end)
 
         it('hands the Director the callback return list unchanged, embedded nils included', function()
