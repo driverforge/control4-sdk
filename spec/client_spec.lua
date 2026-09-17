@@ -710,8 +710,148 @@ describe('anvil', function()
             end
         end)
 
-        it('leaves instrument depth balanced after a nested throw', function()
-            local anvil = instrumentedAnvil()
+        for _, catcher in ipairs({ 'pcall', 'xpcall' }) do
+            it('preserves errors caught by driver ' .. catcher .. ' inside an instrumented handler', function()
+                for _, box in ipairs({ {}, { value = false }, { value = 42 },
+                    { value = 'driver error' }, { value = {} } }) do
+                    local anvil = instrumentedAnvil()
+                    local function inner() error(box.value, 0) end
+                    local function catch(fn)
+                        if catcher == 'pcall' then return pcall(fn) end
+                        return xpcall(fn, function(err)
+                            assert.are.equal(box.value, err)
+                            return err
+                        end)
+                    end
+                    local rawOk, rawError = catch(inner)
+                    local ok, err = anvil:instrument('Outer', function()
+                        return catch(function() anvil:instrument('Inner', inner) end)
+                    end)
+                    assert.are.equal(rawOk, ok)
+                    assert.are.equal(rawError, err)
+                end
+            end)
+        end
+
+        it('reports a fresh throw even when a caught inner error has the same value', function()
+            for _, box in ipairs({ {}, { value = false }, { value = 'same error' }, { value = {} } }) do
+                local anvil, sent = instrumentedAnvil()
+                local ok, err = pcall(function()
+                    anvil:instrument('Outer', function()
+                        for _ = 1, 2 do
+                            pcall(function()
+                                anvil:instrument('Inner', function() error(box.value, 0) end)
+                            end)
+                        end
+                        error(box.value, 0)
+                    end)
+                end)
+                assert.is_false(ok)
+                assert.are.equal(box.value, err)
+                local errors = {}
+                for _, envelope in ipairs(sent) do
+                    if envelope.eventType == 'error' then errors[#errors + 1] = envelope.payload end
+                end
+                assert.are.equal(3, #errors)
+                assert.are.equal('Outer', errors[3].eventName)
+            end
+        end)
+
+        it('preserves nested errors and context when debug metadata is unavailable', function()
+            for _, getinfo in ipairs({ function() return nil end,
+                function() error('debug failed', 0) end, function() return {} end }) do
+                local anvil = instrumentedAnvil()
+                local thrown = {}
+                local ok, err, before, after
+                withDebugStubs({ getinfo = getinfo }, function()
+                    anvil:instrument('Outer', function()
+                        before = anvil._currentTraceId
+                        ok, err = pcall(function()
+                            anvil:instrument('Inner', function() error(thrown, 0) end)
+                        end)
+                        after = anvil._currentTraceId
+                    end)
+                end)
+                assert.is_false(ok)
+                assert.are.equal(thrown, err)
+                assert.are.equal(before, after)
+            end
+        end)
+
+        -- LuaJIT does not invoke a nested xpcall message handler while an
+        -- outer message handler is active. Exercise this case only on runtimes
+        -- that can collect the second exception at all.
+        local supportsNestedErrorHandlers = false
+        xpcall(function() error('outer', 0) end, function()
+            xpcall(function() error('inner', 0) end, function()
+                supportsNestedErrorHandlers = true
+            end)
+        end)
+        if supportsNestedErrorHandlers then
+            it('reports errors raised inside a driver error handler separately', function()
+                local anvil, sent = instrumentedAnvil()
+                local original, replacement = {}, {}
+                local ok, err = xpcall(function()
+                    anvil:instrument('First', function() error(original, 0) end)
+                end, function(caught)
+                    local nestedOk, nestedError = pcall(function()
+                        anvil:instrument('ErrorHandler', function() error(replacement, 0) end)
+                    end)
+                    assert.is_false(nestedOk)
+                    assert.are.equal(replacement, nestedError)
+                    return caught
+                end)
+                assert.is_false(ok)
+                assert.are.equal(original, err)
+                local errors = 0
+                for _, envelope in ipairs(sent) do
+                    if envelope.eventType == 'error' then errors = errors + 1 end
+                end
+                assert.are.equal(2, errors)
+            end)
+        end
+
+        for _, outcome in ipairs({ 'success', 'driver failure', 'telemetry failure' }) do
+            it('restores the outer event context after nested ' .. outcome, function()
+                local anvil, sent = instrumentedAnvil()
+                local realSend = anvil.sendData
+                anvil.sendData = function(self, envelope)
+                    if outcome == 'telemetry failure' and envelope.eventType == 'event'
+                        and envelope.payload.name == 'Inner' then error('send failed', 0) end
+                    realSend(self, envelope)
+                end
+                anvil.reportSdkFault = function() end
+                anvil:instrument('Outer', function()
+                    anvil:forwardLog('INFO', 'before')
+                    pcall(function()
+                        anvil:instrument('Inner', function()
+                            anvil:forwardLog('INFO', 'inner')
+                            if outcome == 'driver failure' then error('inner error', 0) end
+                        end)
+                    end)
+                    anvil:forwardLog('INFO', 'after')
+                end)
+                local logs, events = {}, {}
+                for _, envelope in ipairs(sent) do
+                    if envelope.eventType == 'log' then logs[envelope.payload.message] = envelope.payload end
+                    if envelope.eventType == 'event' then events[envelope.payload.name] = envelope.payload end
+                end
+                assert.are.equal('Outer', logs.after.eventName)
+                assert.are.equal(logs.before.traceId, logs.after.traceId)
+                assert.are.equal(logs.before.spanId, logs.after.spanId)
+                assert.are_not.equal(logs.inner.traceId, logs.after.traceId)
+                assert.are.equal('Inner', logs.inner.eventName)
+                assert.are.equal(logs.after.traceId, events.Outer.traceId)
+                assert.are.equal('after', events.Outer.lastLog)
+                assert.is_nil(anvil._currentTraceId)
+                assert.is_nil(anvil._currentSpanId)
+                assert.is_nil(anvil._currentEventName)
+                assert.is_nil(next(anvil._eventLastLogs))
+            end)
+        end
+
+        it('reports a subsequent independent throw after a nested throw', function()
+            local anvil, sent = instrumentedAnvil()
             pcall(function()
                 anvil:instrument('OnDriverInit', function()
                     anvil:instrument('OnPropertyChanged', function()
@@ -719,7 +859,12 @@ describe('anvil', function()
                     end)
                 end)
             end)
-            assert.are.equal(0, anvil._instrumentDepth)
+            pcall(function() anvil:instrument('Next', function() error('boom') end) end)
+            local errors = 0
+            for _, envelope in ipairs(sent) do
+                if envelope.eventType == 'error' then errors = errors + 1 end
+            end
+            assert.are.equal(2, errors)
         end)
 
         -- Init-time boundary self-test + fail-open.
@@ -1339,8 +1484,21 @@ describe('anvil', function()
                 assert.is_false(ok)
                 assert.are.equal(thrown, err)
                 assert.are.equal(1, #sent)
-                assert.are.equal(0, anvil._timerDepth)
-                assert.are.equal(0, anvil._instrumentDepth or 0)
+            end
+        end)
+
+        it('preserves timer errors caught by driver code inside another callback', function()
+            for _, box in ipairs({ {}, { value = false }, { value = 'timer error' }, { value = {} } }) do
+                local anvil = freshAnvil()
+                anvil.sendData = function() end
+                local caughtOk, caughtError
+                anvil:setTimer(50, function()
+                    caughtOk, caughtError = pcall(function()
+                        anvil:setTimer(20, function() error(box.value, 0) end)
+                    end)
+                end)
+                assert.is_false(caughtOk)
+                assert.are.equal(box.value, caughtError)
             end
         end)
 

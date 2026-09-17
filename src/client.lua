@@ -26,26 +26,33 @@ local function failedTrace()
     return { schemaVersion = 1, captureKind = "exception", status = "failed", reasons = { "capture_failed" } }
 end
 
--- Marker for an error that an inner instrument() frame has ALREADY reported.
--- When instrument re-raises a handler's error so the Director sees it (the
--- non-mutation rule), a nested outer instrument frame would otherwise catch
--- and report the same throw again — one report per nesting level. We wrap the
--- re-raised error in a tagged table so outer frames recognise it and skip
--- reporting; the OUTERMOST frame unwraps it back to the original before it
--- reaches the Director, so the driver still throws exactly what it would have
--- unwrapped. Keyed by a private field, not the value's identity, so an error
--- string interned elsewhere can't be mistaken for one of ours.
-local DF_REPORTED = {}
-local function isReportedError(e)
-    return type(e) == "table" and rawget(e, DF_REPORTED) == true
+-- Keep the original error visible to every caller, including driver-owned
+-- pcall/xpcall. A dedicated live frame identifies our rethrow to an enclosing
+-- collector without tagging the error or remembering values between throws.
+local function rethrow(original)
+    error(original, 0)
 end
-local function tagReportedError(original)
-    if isReportedError(original) then return original end
-    return { [DF_REPORTED] = true, original = original }
-end
-local function unwrapReportedError(e)
-    if isReportedError(e) then return rawget(e, "original") end
-    return e
+
+local function isSdkRethrow(boundary)
+    -- Only the first Lua frame below this error handler can be the throw site.
+    -- Searching the whole stack would mistake a new error in a driver's error
+    -- handler for the older SDK rethrow still live underneath it.
+    local ok, reported = pcall(function()
+        local pastBoundary = false
+        -- The boundary is near the top; cap even a broken metadata provider.
+        for level = 2, 16 do
+            local info = debug.getinfo(level, "fS")
+            if not info then return false end
+            if pastBoundary and info.what ~= "C" then
+                return info.func == rethrow
+            end
+            if info.func == boundary then pastBoundary = true end
+        end
+        return false
+    end)
+    -- Missing/broken debug metadata may duplicate a report, but must never
+    -- replace the driver's error or suppress collection based on a guess.
+    return ok and reported
 end
 
 -- The runtime floor, expressed as capabilities rather than a version number.
@@ -723,17 +730,13 @@ local _M = (function()
             return
         end
 
-        -- Store current event context for log/error payload generation
+        -- Nested handlers own their logs while running, then restore the
+        -- enclosing event so its remaining logs keep their original owner.
+        local parentTraceId, parentSpanId, parentEventName =
+            self._currentTraceId, self._currentSpanId, self._currentEventName
         self._currentTraceId = traceId
         self._currentSpanId = spanId
         self._currentEventName = name
-
-        -- Track instrument nesting so the outermost frame — and only it — turns
-        -- a reported error back into the driver's original before the Director
-        -- sees it (dedup: see DF_REPORTED). Balanced against the decrement
-        -- just before the re-raise/return below; nothing between throws out (the
-        -- driver call is inside xpcall, telemetry inside runSdkWork).
-        self._instrumentDepth = (self._instrumentDepth or 0) + 1
 
         -- Capture the handler's args arity- and nil-exact for the call below.
         -- The call unpacks them explicitly rather than relying on xpcall
@@ -750,12 +753,13 @@ local _M = (function()
         local startTime = C4:GetTime()
         -- Save the original error before diagnostics so capture failure cannot
         -- replace it. Capture while the failing driver's frames are still live.
-        local caughtError, caughtStack, errorSaved
+        local caughtError, caughtStack, errorSaved, isReraise
         local function onError(errorMessage)
             if errorSaved then return end
             errorSaved = true
             caughtError = errorMessage
-            if not isReportedError(errorMessage) then
+            isReraise = isSdkRethrow(onError)
+            if not isReraise then
                 caughtStack = Diagnostics.capture({ captureKind = "exception", boundary = onError })
             end
         end
@@ -772,8 +776,6 @@ local _M = (function()
         -- A re-raise from an inner instrument frame: the error was already
         -- reported there, so this (outer) frame records its own event but must
         -- NOT emit a second error report for the same throw.
-        local isReraise = isReportedError(caughtError)
-
         self:runSdkWork("instrument:" .. name, function()
             self:debug("Finished executing wrapped function ", name, " (", endTime - startTime, "ms)")
 
@@ -833,35 +835,16 @@ local _M = (function()
             end
         end)
 
-        -- Clear per-trace context. Plain assignments (cannot throw); run
-        -- whether telemetry succeeded or not, and BEFORE the re-raise so a
-        -- handler that re-enters sees clean state.
-        self._currentTraceId = nil
-        self._currentSpanId = nil
-        self._currentEventName = nil
+        -- Restore context even if telemetry failed, and before any rethrow.
+        -- Only this invocation's retained data is discarded.
+        self._currentTraceId = parentTraceId
+        self._currentSpanId = parentSpanId
+        self._currentEventName = parentEventName
         self._eventLastLogs[traceId] = nil
         self._eventStacktraces[traceId] = nil
         self._errorMessages[traceId] = nil
 
-        -- Balances the increment above. After this, a value > 0 means an outer
-        -- instrument frame is still active and will do the final unwrap.
-        self._instrumentDepth = self._instrumentDepth - 1
-
-        -- Driver-visible outcome: exactly what an unwrapped handler would do.
-        -- The SDK observes; it must not mutate driver behaviour. Level 0: the
-        -- original message already carries its position info.
-        if not success then
-            if self._instrumentDepth > 0 or (self._timerDepth or 0) > 0 then
-                -- An outer instrument frame will catch this. Tag it so that
-                -- frame skips re-reporting the same throw (idempotent: an
-                -- already-tagged error passes through unchanged).
-                error(tagReportedError(caughtError), 0)
-            else
-                -- Outermost frame: the Director must see exactly what the
-                -- driver threw, so strip our reporting tag back off.
-                error(unwrapReportedError(caughtError), 0)
-            end
-        end
+        if not success then rethrow(caughtError) end
 
         -- results[1] is xpcall's success flag; everything after it is the
         -- handler's full return list, embedded nils included.
@@ -1058,14 +1041,14 @@ local _M = (function()
             if self._instrumentationDisabled or (self._hasLateInited and not self:isAgentInstalled()) then
                 return callback(timer, ...)
             end
-            self._timerDepth = (self._timerDepth or 0) + 1
             local callbackArgs = pack(timer, ...)
-            local caughtError, caughtStack, errorSaved
+            local caughtError, caughtStack, errorSaved, isReraise
             local function onError(e)
                 if errorSaved then return end
                 errorSaved = true
                 caughtError = e
-                if not isReportedError(e) then
+                isReraise = isSdkRethrow(onError)
+                if not isReraise then
                     caughtStack = Diagnostics.capture({ captureKind = "exception", boundary = onError })
                 end
             end
@@ -1073,19 +1056,15 @@ local _M = (function()
                 return callback(unpack(callbackArgs, 1, callbackArgs.n))
             end, onError))
 
-            self._timerDepth = self._timerDepth - 1
             if not results[1] then
-                if not isReportedError(caughtError) then
+                if not isReraise then
                     self:runSdkWork("timer", function()
                         self:sendData(self:generateErrorPayload(
                             nil, nil, nil, timerName, {}, caughtError, caughtStack
                         ))
                     end)
                 end
-                if (self._instrumentDepth or 0) > 0 or self._timerDepth > 0 then
-                    error(tagReportedError(caughtError), 0)
-                end
-                error(unwrapReportedError(caughtError), 0)
+                rethrow(caughtError)
             end
 
             return unpack(results, 2, results.n)
@@ -1549,6 +1528,10 @@ local _M = (function()
             .. anvil.MINIMUM_OS .. " - the SDK has disabled itself and the"
             .. " driver will run uninstrumented.")
     end
+
+    -- The harness's late-init pcall also rethrows after its lifecycle beacon.
+    -- Use the same boundary so an enclosing collector recognises that rethrow.
+    anvil.rethrow = rethrow
 
     -- Identify SDK frames by function identity, including helpers that can
     -- appear beneath a driver callback. Never infer ownership from filenames.

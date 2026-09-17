@@ -1,5 +1,7 @@
 local anvil = require 'client'
 local Diagnostics = require 'diagnostics'
+local unpack = table.unpack or unpack
+local function pack(...) return { n = select('#', ...), ... } end
 -- Module return, kept out of the host driver's _G. pcall so an odd
 -- embedding without the version module degrades to "unknown" instead of
 -- failing the whole harness load.
@@ -71,7 +73,7 @@ Driverforge = Driverforge or {
 Anvil = Anvil or {
     OnDriverInit = function(self, func, strDIR)
         anvil:debug("Anvil:OnDriverInit has been called, instrumenting")
-        anvil:instrument('OnDriverInit', func, strDIR)
+        return anvil:instrument('OnDriverInit', func, strDIR)
     end,
 
     ForwardLog = function(self, logLevel, message)
@@ -131,8 +133,10 @@ function OnDriverLateInit(...)
         anvil:discardQueue()
     end
 
-    local ok, err = pcall(anvil.instrument, anvil,
-        'OnDriverLateInit', anvil.EventHandlers.OnDriverLateInit, ...)
+    -- Keep the full result list, including nils, while the lifecycle beacon
+    -- runs before control returns to the caller.
+    local results = pack(pcall(anvil.instrument, anvil,
+        'OnDriverLateInit', anvil.EventHandlers.OnDriverLateInit, ...))
 
     -- Tell the agent this driver has finished coming up. Gated on the agent
     -- being installed: without an agent the beacon would queue forever (the
@@ -146,12 +150,13 @@ function OnDriverLateInit(...)
 
     -- instrument() already reported the error; re-raise it unchanged so the
     -- Director sees exactly what an uninstrumented driver would have thrown.
-    if not ok then error(err, 0) end
+    if not results[1] then anvil.rethrow(results[2]) end
+    return unpack(results, 2, results.n)
 end
 
 function OnPropertyChanged(sProperty, ...)
     anvil:refreshDebugCache(sProperty)
-    anvil:instrument('OnPropertyChanged', anvil.EventHandlers.OnPropertyChanged, sProperty, ...)
+    return anvil:instrument('OnPropertyChanged', anvil.EventHandlers.OnPropertyChanged, sProperty, ...)
 end
 
 -- Always defined, like OnDriverLateInit/OnPropertyChanged above — NOT left to

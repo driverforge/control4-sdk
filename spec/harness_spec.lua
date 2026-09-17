@@ -16,10 +16,12 @@ describe('harness', function()
         _G.OnPropertyChanged = nil
         _G.OnDriverAdded = nil
         _G.ExecuteCommand = nil
+        _G.ReceivedFromProxy = nil
     end
 
-    local function loadHarness(c4Overrides, properties)
+    local function loadHarness(c4Overrides, properties, handlers)
         clearAnvilModules()
+        for name, handler in pairs(handlers or {}) do _G[name] = handler end
         _G.C4 = c4Overrides or {
             GetUniqueMAC = function() return 'AA:BB:CC' end,
             GetTime = function() return 0 end,
@@ -186,6 +188,85 @@ describe('harness', function()
         assert.is_nil(Anvil.logger)
     end)
 
+    describe('handler return parity', function()
+        local unpack = table.unpack or unpack
+        local function pack(...) return { n = select('#', ...), ... } end
+
+        local function prepare(mode, name, handler)
+            local handlers = name ~= 'Anvil:OnDriverInit' and { [name] = handler } or {}
+            local _, anvil = loadHarness({
+                GetUniqueMAC = function() return 'AA:BB:CC' end,
+                GetTime = function() return 0 end,
+                UUID = function() return 'abcdabcd-1234-5678-9abc-def012345678' end,
+                GetDriverFileName = function() return 'driver.c4z' end,
+                GetDevicesByC4iName = function()
+                    return mode == 'agent present' and { [42] = {} } or {}
+                end,
+            }, nil, handlers)
+            Driverforge:Init('drv_test')
+            anvil._instrumentationDisabled = mode == 'instrumentation disabled'
+            local sent = {}
+            anvil.sendData = function(_, payload) sent[#sent + 1] = payload end
+            if name ~= 'OnDriverLateInit' then OnDriverLateInit() end
+            local function invoke(arg)
+                if name == 'Anvil:OnDriverInit' then
+                    return Anvil:OnDriverInit(handler, arg)
+                end
+                return _G[name](arg)
+            end
+            return invoke, sent
+        end
+
+        for _, mode in ipairs({ 'agent present', 'agent absent', 'instrumentation disabled' }) do
+            -- Include generated and explicit wrappers that already preserve
+            -- returns: the contract belongs to the public entry points.
+            for _, name in ipairs({ 'OnPropertyChanged', 'OnDriverLateInit', 'Anvil:OnDriverInit',
+                'ReceivedFromProxy', 'OnDriverAdded', 'ExecuteCommand' }) do
+                it(name .. ' preserves return arity and identity with ' .. mode, function()
+                    local object = {}
+                    for _, values in ipairs({ pack(), pack(nil), pack(false),
+                        pack(object), pack(nil, object, nil, false, 'tail', nil) }) do
+                        local calls = 0
+                        local function handler(arg)
+                            assert.are.equal('driver-argument', arg)
+                            calls = calls + 1
+                            return unpack(values, 1, values.n)
+                        end
+                        local expected = pack(handler('driver-argument'))
+                        local invoke = prepare(mode, name, handler)
+                        local actual = pack(invoke('driver-argument'))
+                        assert.are.equal(2, calls)
+                        assert.are.equal(expected.n, actual.n)
+                        for i = 1, expected.n do
+                            assert.are.equal(expected[i], actual[i])
+                        end
+                    end
+                end)
+            end
+
+            it('late-init reports ready after completion and preserves errors with ' .. mode, function()
+                for _, failure in ipairs({ pack(nil), pack(false), pack({}), pack('driver error') }) do
+                    local completed = false
+                    local function handler()
+                        completed = true
+                        error(failure[1], 0)
+                    end
+                    local invoke, sent = prepare(mode, 'OnDriverLateInit', handler)
+                    local ok, err = pcall(invoke)
+                    assert.is_true(completed)
+                    assert.is_false(ok)
+                    assert.are.equal(failure[1], err)
+                    if mode == 'agent present' then
+                        assert.are.equal('lifecycle', sent[#sent].eventType)
+                        assert.are.equal('ready', sent[#sent].payload.phase)
+                    else
+                        assert.are.equal(0, #sent)
+                    end
+                end
+            end)
+        end
+    end)
+
     describe('ready lifecycle beacon', function()
         -- C4 stub that also resolves an agent device, so discoverAnvilAgent
         -- finds one (or not, when GetDevicesByC4iName returns empty).
@@ -213,6 +294,27 @@ describe('harness', function()
             end
             return out
         end
+
+        it('reports a late-init error once when called inside another instrumented handler', function()
+            local thrown = {}
+            local _, anvil = loadHarness(c4WithAgent({ [42] = {} }), nil, {
+                OnDriverLateInit = function() error(thrown, 0) end,
+            })
+            Driverforge:Init('drv_x')
+            local sent = {}
+            anvil.sendData = function(_, envelope) sent[#sent + 1] = envelope end
+            local ok, err = pcall(function()
+                Anvil:OnDriverInit(function() OnDriverLateInit() end)
+            end)
+            assert.is_false(ok)
+            assert.are.equal(thrown, err)
+            local errors = 0
+            for _, envelope in ipairs(sent) do
+                if envelope.eventType == 'error' then errors = errors + 1 end
+            end
+            assert.are.equal(1, errors)
+            assert.are.equal(1, #lifecycleEvents(sent))
+        end)
 
         it('fires a ready beacon at the end of OnDriverLateInit when the agent is present', function()
             local Anvil, anvil = loadHarness(c4WithAgent({ [42] = {} }))
