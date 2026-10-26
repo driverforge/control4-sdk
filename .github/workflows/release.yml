@@ -8,10 +8,10 @@ run-name: Release — v${{ inputs.version }}
 # behind a closed door and signed by an unobservable process is trust by
 # assertion; this is trust you can check.
 #
-# The artifact is distributed from Azure, not from here — attestations bind to
-# the artifact digest rather than to where it is hosted, so a user verifies the
-# file they downloaded from releases.driverforge.com against an attestation
-# fetched from this repo.
+# The artifact is distributed from releases.driverforge.com, not from here —
+# attestations bind to the artifact digest rather than to where it is hosted,
+# so a user verifies the file they downloaded from releases.driverforge.com
+# against an attestation fetched from this repo.
 
 on:
   workflow_dispatch:
@@ -22,12 +22,17 @@ on:
         type: string
 
 env:
-  AZURE_STORAGE_CONTAINER: driverforge-releases
+  # releases.driverforge.com is CloudFront in front of this bucket; every path
+  # keeps the `driverforge-releases/` segment the URLs have always had.
+  RELEASES_BUCKET: driverforge-prod-releases
+  RELEASES_PREFIX: driverforge-releases
   ARTIFACT_PATH: driverforge-sdk
-  # The signing key's private half is non-exportable, so signing happens via the
-  # Key Vault API and no key material ever reaches the runner.
-  AZURE_KEY_VAULT: kmsgroup-keyvault
-  RELEASE_SIGNING_KEY: release-signing-v1
+  # The signing key lives in AWS KMS, imported from a key generated offline;
+  # KMS will not export it, so signing happens via the KMS API and no key
+  # material ever reaches the runner. The id is what the CLI selects the public
+  # key by.
+  RELEASE_SIGNING_KEY: release-signing-v2
+  RELEASE_SIGNING_KEY_ALIAS: alias/driverforge-release-signing-v2
 
 permissions:
   contents: read
@@ -35,9 +40,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # The federated credentials are pinned to
-    # repo:driverforge/control4-sdk:environment:release — Azure AD needs an
-    # exact subject and refs/tags/* is not expressible, so the environment is
+    # The AWS release role trusts exactly
+    # repo:driverforge@182759942/control4-sdk@1338941434:environment:release
+    # (GitHub's immutable subject, with org and repo IDs), so the environment is
     # what binds this job to the signing identity. Its branch policy restricts
     # deployments to main, so the only commits that can reach the signing key
     # are ones the mirror sync put there — a branch pushed straight to this
@@ -45,7 +50,7 @@ jobs:
     environment: release
     permissions:
       contents: write        # create the tag and the GitHub Release
-      id-token: write        # OIDC, for azure/login and for the attestation
+      id-token: write        # OIDC, for the release role and for the attestation
       attestations: write    # record the provenance statement
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -97,7 +102,7 @@ jobs:
           zip "driverforge-sdk-${VERSION}.zip" driverforge-sdk.lua
           rm driverforge-sdk.lua
 
-      # Attest the exact bytes that reach Azure. Any re-zip or repackaging after
+      # Attest the exact bytes that get published. Any re-zip or repackaging after
       # this point changes the digest and the attestation stops matching what a
       # user downloads, so nothing may touch the file again.
       - name: Attest build provenance
@@ -117,7 +122,7 @@ jobs:
       - name: Generate manifest
         run: |
           VERSION="${{ inputs.version }}"
-          BASE_URL="https://releases.driverforge.com/$AZURE_STORAGE_CONTAINER/$ARTIFACT_PATH/v$VERSION"
+          BASE_URL="https://releases.driverforge.com/$RELEASES_PREFIX/$ARTIFACT_PATH/v$VERSION"
           # Checksum the exact bytes that get uploaded. The CLI refuses to
           # install an SDK whose manifest has no sha256, so this field is
           # mandatory, not decorative. sha256sum emits lowercase hex.
@@ -150,95 +155,59 @@ jobs:
             }' \
             > publish/manifest.json
 
-      - name: Authenticate to Azure for signing
-        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+      # The role may write under driverforge-releases/driverforge-sdk/, never
+      # delete, and sign with the release key as RS256. Its ARN is a repo
+      # variable: `pulumi stack output releasePublisherRoles` → .sdk
+      - name: Assume the release role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          client-id: ${{ vars.AZURE_RELEASE_SIGNER_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          # The identity holds one role: Key Vault Crypto User scoped to the
-          # signing key alone. It has no subscription-level reader, so asking
-          # for a subscription context would fail the login.
-          allow-no-subscriptions: true
+          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-west-2
 
       - name: Sign the manifest
         run: |
           set -euo pipefail
           # Sign the file exactly as uploaded. Re-serialising the JSON here
           # would reorder keys and produce a signature the CLI rejects.
-          DIGEST="$(openssl dgst -sha256 -binary publish/manifest.json | base64)"
-          SIG="$(az keyvault key sign \
-            --vault-name "$AZURE_KEY_VAULT" \
-            --name "$RELEASE_SIGNING_KEY" \
-            --algorithm RS256 \
-            --digest "$DIGEST" \
-            --query signature -o tsv)"
+          openssl dgst -sha256 -binary publish/manifest.json > manifest.digest
+          SIG="$(aws kms sign \
+            --key-id "$RELEASE_SIGNING_KEY_ALIAS" \
+            --message fileb://manifest.digest --message-type DIGEST \
+            --signing-algorithm RSASSA_PKCS1_V1_5_SHA_256 \
+            --query Signature --output text)"
+          rm manifest.digest
           jq -n \
             --arg keyId "$RELEASE_SIGNING_KEY" \
             --arg sig "$SIG" \
             '{alg: "RS256", keyId: $keyId, sig: $sig}' \
             > publish/manifest.json.sig
 
-      - name: Upload to Azure Blob Storage
-        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2
-        with:
-          inlineScript: |
-            VERSION="${{ inputs.version }}"
-            ZIP="publish/driverforge-sdk-${VERSION}.zip"
-            BUNDLE="publish/driverforge-sdk-${VERSION}.sigstore.json"
-            MANIFEST="publish/manifest.json"
-            SIGNATURE="publish/manifest.json.sig"
+      - name: Upload to the releases bucket
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          DEST="s3://$RELEASES_BUCKET/$RELEASES_PREFIX/$ARTIFACT_PATH"
+          ZIP="publish/driverforge-sdk-${VERSION}.zip"
+          BUNDLE="publish/driverforge-sdk-${VERSION}.sigstore.json"
+          MANIFEST="publish/manifest.json"
+          SIGNATURE="publish/manifest.json.sig"
+          IMMUTABLE="public, max-age=31536000, immutable"
+          LATEST="no-cache, must-revalidate"
 
-            # Versioned path: immutable, filename includes version
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/v$VERSION/driverforge-sdk-${VERSION}.zip" \
-              -f "$ZIP" \
-              --content-cache-control "public, max-age=31536000, immutable" \
-              --overwrite
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/v$VERSION/driverforge-sdk-${VERSION}.sigstore.json" \
-              -f "$BUNDLE" \
-              --content-cache-control "public, max-age=31536000, immutable" \
-              --overwrite
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/v$VERSION/manifest.json" \
-              -f "$MANIFEST" \
-              --content-cache-control "public, max-age=31536000, immutable" \
-              --overwrite
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/v$VERSION/manifest.json.sig" \
-              -f "$SIGNATURE" \
-              --content-cache-control "public, max-age=31536000, immutable" \
-              --overwrite
+          # Versioned path: immutable, filename includes version
+          aws s3 cp "$ZIP" "$DEST/v$VERSION/driverforge-sdk-${VERSION}.zip" --cache-control "$IMMUTABLE"
+          aws s3 cp "$BUNDLE" "$DEST/v$VERSION/driverforge-sdk-${VERSION}.sigstore.json" --cache-control "$IMMUTABLE"
+          aws s3 cp "$MANIFEST" "$DEST/v$VERSION/manifest.json" --cache-control "$IMMUTABLE"
+          aws s3 cp "$SIGNATURE" "$DEST/v$VERSION/manifest.json.sig" --cache-control "$IMMUTABLE"
 
-            # Latest path: no-cache, stable filename so direct-download URLs
-            # don't break between versions.
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/latest/driverforge-sdk-latest.zip" \
-              -f "$ZIP" \
-              --content-cache-control "no-cache, must-revalidate" \
-              --overwrite
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/latest/driverforge-sdk-latest.sigstore.json" \
-              -f "$BUNDLE" \
-              --content-cache-control "no-cache, must-revalidate" \
-              --overwrite
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/latest/manifest.json" \
-              -f "$MANIFEST" \
-              --content-cache-control "no-cache, must-revalidate" \
-              --overwrite
-            # latest/manifest.json is byte-identical to the versioned copy, so
-            # the same signature covers both.
-            az storage blob upload -c "$AZURE_STORAGE_CONTAINER" \
-              -n "$ARTIFACT_PATH/latest/manifest.json.sig" \
-              -f "$SIGNATURE" \
-              --content-cache-control "no-cache, must-revalidate" \
-              --overwrite
-        env:
-          # Non-sensitive account name is a repo variable; only the key is a
-          # secret.
-          AZURE_STORAGE_ACCOUNT: ${{ vars.AZURE_STORAGE_ACCOUNT }}
-          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          # Latest path: no-cache, stable filename so direct-download URLs
+          # don't break between versions.
+          aws s3 cp "$ZIP" "$DEST/latest/driverforge-sdk-latest.zip" --cache-control "$LATEST"
+          aws s3 cp "$BUNDLE" "$DEST/latest/driverforge-sdk-latest.sigstore.json" --cache-control "$LATEST"
+          aws s3 cp "$MANIFEST" "$DEST/latest/manifest.json" --cache-control "$LATEST"
+          # latest/manifest.json is byte-identical to the versioned copy, so
+          # the same signature covers both.
+          aws s3 cp "$SIGNATURE" "$DEST/latest/manifest.json.sig" --cache-control "$LATEST"
 
       - name: Create GitHub Release and tag
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
