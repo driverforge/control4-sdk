@@ -105,13 +105,20 @@ jobs:
       # Attest the exact bytes that get published. Any re-zip or repackaging after
       # this point changes the digest and the attestation stops matching what a
       # user downloads, so nothing may touch the file again.
+      #
+      # Public repositories only: GitHub's attestation store is not available to
+      # a private repository on the free plan. The gate is the repository's
+      # visibility, so attestation comes back, and blocks a release again, the
+      # moment the repository is public.
       - name: Attest build provenance
         id: attest
+        if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: publish/driverforge-sdk-${{ inputs.version }}.zip
 
       - name: Stage the attestation bundle
+        if: steps.attest.outcome == 'success'
         # Published alongside the artifact so verification works offline, via
         # `gh attestation verify --bundle`, without reaching the GitHub API.
         run: |
@@ -196,18 +203,22 @@ jobs:
 
           # Versioned path: immutable, filename includes version
           aws s3 cp "$ZIP" "$DEST/v$VERSION/driverforge-sdk-${VERSION}.zip" --cache-control "$IMMUTABLE"
-          aws s3 cp "$BUNDLE" "$DEST/v$VERSION/driverforge-sdk-${VERSION}.sigstore.json" --cache-control "$IMMUTABLE"
           aws s3 cp "$MANIFEST" "$DEST/v$VERSION/manifest.json" --cache-control "$IMMUTABLE"
           aws s3 cp "$SIGNATURE" "$DEST/v$VERSION/manifest.json.sig" --cache-control "$IMMUTABLE"
 
           # Latest path: no-cache, stable filename so direct-download URLs
           # don't break between versions.
           aws s3 cp "$ZIP" "$DEST/latest/driverforge-sdk-latest.zip" --cache-control "$LATEST"
-          aws s3 cp "$BUNDLE" "$DEST/latest/driverforge-sdk-latest.sigstore.json" --cache-control "$LATEST"
           aws s3 cp "$MANIFEST" "$DEST/latest/manifest.json" --cache-control "$LATEST"
           # latest/manifest.json is byte-identical to the versioned copy, so
           # the same signature covers both.
           aws s3 cp "$SIGNATURE" "$DEST/latest/manifest.json.sig" --cache-control "$LATEST"
+
+          # The provenance bundle, where there is one (see "Attest build provenance").
+          if [ -e "$BUNDLE" ]; then
+            aws s3 cp "$BUNDLE" "$DEST/v$VERSION/driverforge-sdk-${VERSION}.sigstore.json" --cache-control "$IMMUTABLE"
+            aws s3 cp "$BUNDLE" "$DEST/latest/driverforge-sdk-latest.sigstore.json" --cache-control "$LATEST"
+          fi
 
       - name: Create GitHub Release and tag
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
