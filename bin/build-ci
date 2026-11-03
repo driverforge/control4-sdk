@@ -14,33 +14,42 @@ mkdir -p dist
 # inline license headers.
 squish --no-minify
 
-# Inject the attestation root PUBLIC key into the build OUTPUT at the sentinel
+# Inject the attestation root PUBLIC keys into the build OUTPUT at the sentinel
 # marker. Committed source keeps an empty key map; only the built
-# bundle carries a key, so the dev key never lands in mirrored source. With no
-# key provided the bundle keeps the empty map and agent verification stays
+# bundle carries keys, so the dev key never lands in mirrored source. With no
+# keys provided the bundle keeps the empty map and agent verification stays
 # disabled (the legacy discovery-trusts-filename behaviour).
-if [ -n "${SDK_ATTESTATION_N:-}" ]; then
-    kid="${SDK_ATTESTATION_KID:?SDK_ATTESTATION_KID is required alongside the key}"
-    e_hex="${SDK_ATTESTATION_E:?SDK_ATTESTATION_E is required alongside the modulus}"
+#
+# SDK_ATTESTATION_KEYS is one `kid:n:e` per key, space-separated (bin/build).
+if [ -n "${SDK_ATTESTATION_KEYS:-}" ]; then
+    entries=""
+    for key in $SDK_ATTESTATION_KEYS; do
+        kid="${key%%:*}"
+        rest="${key#*:}"
+        n_hex="${rest%%:*}"
+        e_hex="${rest#*:}"
 
-    # Guard: the modulus and exponent are hex, and only hex. Anything else is
-    # either the wrong material or a quoting accident, and both must fail the
-    # build rather than embed a key the SDK cannot parse.
-    if ! printf '%s' "$SDK_ATTESTATION_N" | grep -qE '^[0-9a-f]+$' \
-        || ! printf '%s' "$e_hex" | grep -qE '^[0-9a-f]+$'; then
-        echo "::error::attestation key material is not lowercase hex (kid ${kid})" >&2
-        exit 1
-    fi
+        # Guard: the modulus and exponent are hex, and only hex. Anything else
+        # is either the wrong material or a quoting accident, and both must
+        # fail the build rather than embed a key the SDK cannot parse.
+        if ! printf '%s' "$n_hex" | grep -qE '^[0-9a-f]+$' \
+            || ! printf '%s' "$e_hex" | grep -qE '^[0-9a-f]+$'; then
+            echo "::error::attestation key material is not lowercase hex (kid ${kid})" >&2
+            exit 1
+        fi
 
-    # Release guard: a prod build must carry the prod kid, never the dev key.
-    if [ "${SDK_BUILD_ENV:-prod}" = "prod" ] && [ "$kid" != "attest-prod-1" ]; then
-        echo "::error::prod build tried to inject kid '${kid}' (expected attest-prod-1)" >&2
-        exit 1
-    fi
+        # Release guard: a prod build carries prod kids only, never the dev key.
+        if [ "${SDK_BUILD_ENV:-prod}" = "prod" ] \
+            && ! printf '%s' "$kid" | grep -qE '^attest-prod-[0-9]+$'; then
+            echo "::error::prod build tried to inject kid '${kid}' (expected attest-prod-N)" >&2
+            exit 1
+        fi
+
+        entries="${entries}${entries:+, }[\"${kid}\"] = { n = \"${n_hex}\", e = \"${e_hex}\" }"
+    done
 
     keyfile="dist/.attestation-keys.lua"
-    printf 'M.ROOT_PUBLIC_KEYS = { ["%s"] = { n = "%s", e = "%s" } }\n' \
-        "$kid" "$SDK_ATTESTATION_N" "$e_hex" > "$keyfile"
+    printf 'M.ROOT_PUBLIC_KEYS = { %s }\n' "$entries" > "$keyfile"
 
     # Replace the single marker line with the populated map.
     awk -v kf="$keyfile" '
@@ -54,11 +63,14 @@ if [ -n "${SDK_ATTESTATION_N:-}" ]; then
     mv dist/driverforge-sdk.lua.tmp dist/driverforge-sdk.lua
     rm -f "$keyfile"
 
-    if ! grep -q "\[\"${kid}\"\]" dist/driverforge-sdk.lua; then
-        echo "::error::attestation key injection did not take — marker not found in the bundle" >&2
-        exit 1
-    fi
-    echo "Injected attestation key (kid: ${kid})"
+    for key in $SDK_ATTESTATION_KEYS; do
+        kid="${key%%:*}"
+        if ! grep -q "\[\"${kid}\"\]" dist/driverforge-sdk.lua; then
+            echo "::error::attestation key injection did not take — marker not found in the bundle" >&2
+            exit 1
+        fi
+        echo "Injected attestation key (kid: ${kid})"
+    done
 else
     echo "No attestation key provided — agent verification disabled in this build"
 fi

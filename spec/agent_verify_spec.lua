@@ -18,7 +18,10 @@ describe('agent_verify', function()
     local AgentVerify = require 'agent_verify'
 
     -- === Test PKI (built once) ===
-    local rootKey = openssl.pkey.new('rsa', 2048)
+    -- RSA-4096, the size of the production attestation keys (attest-prod-2 and
+    -- the standby attest-prod-3), so the pure-Lua verifier is exercised at the
+    -- size it meets on a controller.
+    local rootKey = openssl.pkey.new('rsa', 4096)
     local rootPublicPem = rootKey:get_public():export('pem')
 
     local deviceKey = openssl.pkey.new('rsa', 2048)
