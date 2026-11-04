@@ -57,6 +57,20 @@ describe('anvil', function()
             assert.are.equal('AA:BB:CC', envelope.payload.tags.controller)
             assert.are.equal('driver.c4z', envelope.payload.tags.driver)
         end)
+
+        it('stamps the driver version on logs and events', function()
+            local anvil = freshAnvil()
+
+            assert.are.equal('0.1.0', anvil:generatePayload('event', { id = 'e1' }).payload.driverVersion)
+            assert.are.equal('0.1.0', anvil:generateLogMessagePayload('INFO', 'hello').payload.driverVersion)
+        end)
+
+        it('keeps a driver version the caller already set', function()
+            local anvil = freshAnvil()
+            local envelope = anvil:generatePayload('lifecycle', { driverVersion = '42' })
+
+            assert.are.equal('42', envelope.payload.driverVersion)
+        end)
     end)
 
     describe('generateLogMessagePayload', function()

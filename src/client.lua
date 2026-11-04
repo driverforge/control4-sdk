@@ -938,6 +938,12 @@ local _M = (function()
         local event = {}
         data["controller"] = tags["controller"]
         data["driver"] = tags["driver"]
+        -- The deployed driver's <version> on every log, event and error, so
+        -- telemetry can be read back for one deploy. Errors and the lifecycle
+        -- beacon already set it; never overwrite a version the caller chose.
+        if data["driverVersion"] == nil then
+            data["driverVersion"] = self._driverVersion
+        end
         data["tags"] = tags
 
         event["eventType"] = eventType
