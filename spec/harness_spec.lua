@@ -54,6 +54,21 @@ describe('harness', function()
         assert.is_function(Anvil.TelemetryStatus)
     end)
 
+    it('ForwardLog takes log-call arguments, tables included', function()
+        local Anvil, anvil = loadHarness()
+        local sent = {}
+        anvil.sendData = function(_, payload) table.insert(sent, payload) end
+
+        Anvil:ForwardLog('INFO', 'state:', { power = 'on' })
+        Anvil:ForwardLog('WARN', 'plain message')
+
+        assert.are.equal(2, #sent)
+        assert.are.equal('state: [table]', sent[1].payload.message)
+        assert.are.same({ 'state:', { power = 'on' } }, sent[1].payload.args)
+        assert.are.equal('plain message', sent[2].payload.message)
+        assert.is_nil(sent[2].payload.args)
+    end)
+
     it('TelemetryStatus lets a driver see that it is sending into a void', function()
         local Anvil, anvil = loadHarness()
         Driverforge:Init('drv_token')

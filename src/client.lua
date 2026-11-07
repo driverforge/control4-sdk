@@ -1,5 +1,6 @@
 local Queue = require "queue"
 local Diagnostics = require "diagnostics"
+local LogArgs = require "log_args"
 local AgentVerify = require "agent_verify"
 
 -- The C4 runtime is LuaJIT without 5.2 compat: table.unpack does not exist
@@ -458,16 +459,6 @@ local _M = (function()
         trace = "trace",
     }
 
-    local function concatLogArgs(...)
-        -- select('#', ...), not #{...}: an embedded nil argument must not
-        -- truncate the forwarded message.
-        local parts = {}
-        for i = 1, select('#', ...) do
-            parts[i] = tostring(select(i, ...))
-        end
-        return table.concat(parts, " ")
-    end
-
     -- Resolve which method name on the caller's logger corresponds to
     -- a given canonical level. Priority order:
     --   1. Explicit `logMap[canonicalLevel]` — wins (semantic override
@@ -552,18 +543,14 @@ local _M = (function()
                     -- Support both call styles: colon (`Log:Info("x")`,
                     -- self == the logger) and dot (`Log.Info("x")`, where
                     -- what lands in `self` is really the first message
-                    -- argument). Only the FORWARDED message depends on the
+                    -- argument). Only the FORWARDED arguments depend on the
                     -- distinction — the delegation to the original method
                     -- passes every argument through verbatim either way, so
                     -- the driver's own logging behaviour is untouched.
-                    local message
                     if self == logger then
-                        message = concatLogArgs(...)
+                        anvil:forwardLogArgs(levelName, pack(...))
                     else
-                        message = concatLogArgs(self, ...)
-                    end
-                    if #message > 0 then
-                        anvil:forwardLog(levelName, message)
+                        anvil:forwardLogArgs(levelName, pack(self, ...))
                     end
                     return original(self, ...)
                 end
@@ -851,10 +838,14 @@ local _M = (function()
         return unpack(results, 2, results.n)
     end
 
-    function anvil:generateLogMessagePayload(logLevelName, strMessage)
+    function anvil:generateLogMessagePayload(logLevelName, strMessage, args, argsTruncated)
         local logMessage = {}
         logMessage["level"] = logLevelName
         logMessage["message"] = strMessage
+        -- The call's arguments as plain JSON, present only when one of them
+        -- was not a string (see log_args.lua).
+        logMessage["args"] = args
+        if argsTruncated then logMessage["argsTruncated"] = true end
         logMessage["createdAt"] = C4:GetTime()
         -- A log carries the active event's (traceId, spanId) and name.
         -- A log emitted with no event in flight is its own root trace with
@@ -997,12 +988,25 @@ local _M = (function()
         end)
     end
 
-    function anvil:forwardLog(logLevel, message)
+    function anvil:forwardLog(logLevel, message, args, argsTruncated)
         if self._hasLateInited and not self:isAgentInstalled() then
             self:debug("Anvil agent not installed, not forwarding log message")
             return
         end
-        self:sendData(self:generateLogMessagePayload(logLevel, message))
+        self:sendData(self:generateLogMessagePayload(logLevel, message, args, argsTruncated))
+    end
+
+    -- Forward a log call's arguments, packed ({ n = count, ... }). Encoding
+    -- is skipped entirely without an agent, and runs as SDK work, so nothing
+    -- in it can reach the driver's logger.
+    function anvil:forwardLogArgs(logLevel, packed)
+        if self._hasLateInited and not self:isAgentInstalled() then return end
+        self:runSdkWork("forwardLog", function()
+            local message, args, truncated = LogArgs.encode(packed)
+            if message ~= "" or args then
+                self:forwardLog(logLevel, message, args, truncated)
+            end
+        end)
     end
 
     -- Lifecycle beacon: a small, identity-stamped signal about the driver

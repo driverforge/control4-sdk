@@ -76,8 +76,11 @@ Anvil = Anvil or {
         return anvil:instrument('OnDriverInit', func, strDIR)
     end,
 
-    ForwardLog = function(self, logLevel, message)
-        anvil:forwardLog(logLevel, message)
+    -- Forward a log line from a driver whose logger the SDK does not wrap.
+    -- Takes the same arguments as a log call: tables are sent as structured
+    -- data alongside the message.
+    ForwardLog = function(self, logLevel, ...)
+        anvil:forwardLogArgs(logLevel, { n = select('#', ...), ... })
     end,
 
     -- Manual error capture for non-instrumented contexts (timers, URL callbacks, etc.)

@@ -987,6 +987,74 @@ describe('anvil', function()
             assert.are.equal('call', received[2])
         end)
 
+        it('forwards table arguments as structured args on the log payload', function()
+            local anvil = freshAnvil()
+            local sent = {}
+            anvil.sendData = function(_, payload) table.insert(sent, payload) end
+
+            local received
+            local logger = { debug = function(_, ...) received = { n = select('#', ...), ... } end }
+            anvil:installLoggerProxy(logger)
+
+            local response = { status = 200, body = 'OK' }
+            logger:debug('Response received:', response)
+
+            assert.are.equal(1, #sent)
+            local log = sent[1].payload
+            assert.are.equal('DEBUG', log.level)
+            assert.are.equal('Response received: [table]', log.message)
+            assert.are.same({ 'Response received:', { status = 200, body = 'OK' } }, log.args)
+            assert.is_nil(log.argsTruncated)
+            -- The driver's logger still gets its own table, untouched.
+            assert.are.equal(2, received.n)
+            assert.are.equal(response, received[2])
+        end)
+
+        it('omits args for a text-only log', function()
+            local anvil = freshAnvil()
+            local sent = {}
+            anvil.sendData = function(_, payload) table.insert(sent, payload) end
+            local logger = { info = function() end }
+            anvil:installLoggerProxy(logger)
+
+            logger:info('plain', 'text')
+
+            assert.are.equal('plain text', sent[1].payload.message)
+            assert.is_nil(sent[1].payload.args)
+        end)
+
+        it('does not encode anything once late init finds no agent', function()
+            local anvil = freshAnvil()
+            anvil._hasLateInited = true
+            anvil.isAgentInstalled = function() return false end
+            local LogArgs = require 'log_args'
+            local realEncode, encoded = LogArgs.encode, false
+            LogArgs.encode = function(...) encoded = true; return realEncode(...) end
+            local sent = {}
+            anvil.sendData = function(_, payload) table.insert(sent, payload) end
+
+            local logger = { info = function() end }
+            anvil:installLoggerProxy(logger)
+            logger:info('dropped', { big = true })
+            LogArgs.encode = realEncode
+
+            assert.is_false(encoded)
+            assert.are.equal(0, #sent)
+        end)
+
+        it('keeps the driver log call intact when forwarding fails', function()
+            local anvil = freshAnvil()
+            anvil.sendData = function() error('transport exploded') end
+            anvil.reportSdkFault = function() end
+
+            local received
+            local logger = { warn = function(_, ...) received = { n = select('#', ...), ... } end }
+            anvil:installLoggerProxy(logger)
+
+            assert.has_no.errors(function() logger:warn('still logged', 42) end)
+            assert.are.same({ n = 2, 'still logged', 42 }, received)
+        end)
+
         it('forwards via the caller-supplied logger reference (no proxy table)', function()
             -- Regression guard: the SDK must mutate the
             -- caller's logger in place so existing `Log:Info` call
