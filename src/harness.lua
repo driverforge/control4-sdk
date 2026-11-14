@@ -162,20 +162,14 @@ function OnPropertyChanged(sProperty, ...)
     return anvil:instrument('OnPropertyChanged', anvil.EventHandlers.OnPropertyChanged, sProperty, ...)
 end
 
--- Always defined, like OnDriverLateInit/OnPropertyChanged above — NOT left to
--- the dynamic loop below. The loop only registers handlers the driver itself
--- defined (a nil captured global means the EventHandlers key doesn't exist),
--- and Director only calls globals that exist. OnDriverAdded is the SDK's one
--- rediscovery trigger for an agent installed after this driver, so without an
--- unconditional global that path is dead code and telemetry stays dark until
--- the driver restarts. Delegates to the driver's own handler when captured.
+-- OnDriverAdded is the SDK's one rediscovery trigger for an agent installed
+-- after this driver. Delegates to the driver's own handler when captured.
 function OnDriverAdded(...)
     return anvil:instrument('OnDriverAdded', anvil.EventHandlers.OnDriverAdded, ...)
 end
 
--- Always defined, like OnDriverAdded above: the agent's verification proof
--- arrives as an ExecuteCommand invocation, so the global must exist even
--- when the driver defines no command handler of its own. Protocol traffic
+-- The agent's verification proof arrives as an ExecuteCommand invocation, so
+-- it is checked before the call is instrumented. Protocol traffic
 -- addressed to the SDK is intercepted and never forwarded to the driver's
 -- handler — it would not exist without the SDK, so swallowing it is not a
 -- mutation of driver behaviour (the one carve-out from the non-mutation
@@ -185,8 +179,11 @@ function ExecuteCommand(strCommand, tParams)
     return anvil:instrument('ExecuteCommand', anvil.EventHandlers.ExecuteCommand, strCommand, tParams)
 end
 
--- Dynamically register all remaining event handlers
-for name, _ in pairs(anvil.EventHandlers) do
+-- Register every remaining known handler, implemented or not. Director only
+-- calls globals that exist, so iterating the driver's captured handlers here
+-- would leave unimplemented callbacks with no global, and a call to one would
+-- never be recorded as "not implemented".
+for _, name in ipairs(anvil.HandlerNames) do
     if name ~= "OnDriverLateInit" and name ~= "OnPropertyChanged"
         and name ~= "OnDriverAdded" and name ~= "ExecuteCommand" then
         _G[name] = function(...)
@@ -214,7 +211,7 @@ Diagnostics.registerFunction(Anvil.CaptureError, { skip = true })
 -- throw site is named, not `?`) and the wrappers (labelled as the boundary).
 -- Built here because only the harness knows which _G globals it now owns.
 local ownedWrappers = {}
-for name in pairs(anvil.EventHandlers) do
+for _, name in ipairs(anvil.HandlerNames) do
     ownedWrappers[name] = _G[name]
 end
 anvil:nameHandlerFrames(ownedWrappers)

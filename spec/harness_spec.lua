@@ -1,5 +1,12 @@
 describe('harness', function()
     local function clearAnvilModules()
+        -- The harness defines a global for every known handler; clear them
+        -- all so the next load captures none of a previous load's wrappers
+        -- as driver handlers.
+        local loaded = package.loaded.client
+        if type(loaded) == 'table' and loaded.HandlerNames then
+            for _, name in ipairs(loaded.HandlerNames) do _G[name] = nil end
+        end
         package.loaded.client = nil
         package.loaded.harness = nil
         package.loaded.version = nil
@@ -441,6 +448,43 @@ describe('harness', function()
                 SendToDevice = function(_, _, _, params) table.insert(sent, params) end,
             }, function() installed = true end
         end
+
+        it('defines a global for every known handler, implemented or not', function()
+            local _, anvil = loadHarness()
+            assert.is_true(#anvil.HandlerNames > 100)
+            for _, name in ipairs(anvil.HandlerNames) do
+                assert.is_function(_G[name], name)
+            end
+        end)
+
+        it('records a call to an unimplemented handler as not implemented', function()
+            local _, anvil = loadHarness()
+            Driverforge:Init('drv_x')
+            local sent = {}
+            anvil.sendData = function(_, envelope) sent[#sent + 1] = envelope end
+
+            assert.are.equal(0, select('#', OnTimerExpired(7)))
+
+            assert.are.equal(1, #sent)
+            assert.are.equal('event', sent[1].eventType)
+            assert.are.equal('OnTimerExpired', sent[1].payload.name)
+            assert.are.equal(false, sent[1].payload.implemented)
+        end)
+
+        it('delegates an implemented handler and records it as implemented', function()
+            local _, anvil = loadHarness(nil, nil, {
+                OnTimerExpired = function(id) return id, nil, 'x' end,
+            })
+            Driverforge:Init('drv_x')
+            local sent = {}
+            anvil.sendData = function(_, envelope) sent[#sent + 1] = envelope end
+
+            local function pack(...) return { n = select('#', ...), ... } end
+            assert.are.same({ n = 3, 7, nil, 'x' }, pack(OnTimerExpired(7)))
+
+            assert.are.equal('OnTimerExpired', sent[1].payload.name)
+            assert.are.equal(true, sent[1].payload.implemented)
+        end)
 
         it('defines the OnDriverAdded global even when the driver does not', function()
             loadHarness()
